@@ -106,7 +106,8 @@ def manual_login(context):
     print("→ Log in as usual (email, password, 2FA, any checkpoints).")
     print("→ The script will detect when you're done. Multilogin saves the session automatically.\n")
 
-    page.goto("https://www.facebook.com/login", wait_until="domcontentloaded")
+    page.evaluate("window.location.href = 'https://www.facebook.com/login'")
+    page.wait_for_load_state("domcontentloaded")
 
     timeout = 300
     start = time.time()
@@ -124,7 +125,8 @@ def restore_session(context):
     page = context.pages[0] if context.pages else context.new_page()
 
     print("Checking session...")
-    page.goto("https://www.facebook.com/", wait_until="domcontentloaded")
+    page.evaluate("window.location.href = 'https://www.facebook.com/'")
+    page.wait_for_load_state("domcontentloaded")
     time.sleep(2)
 
     if "login" in page.url:
@@ -136,8 +138,12 @@ def restore_session(context):
 
 
 def open_account(path, account_name, sheet_name, manual):
-    creds = load_credentials(path, account_name, sheet_name)
-    print(f"Account: {creds['name']}  (UID: {creds['uid']})")
+    if path:
+        creds = load_credentials(path, account_name, sheet_name)
+        print(f"Account: {creds['name']}  (UID: {creds['uid']})")
+    else:
+        creds = {"name": account_name, "uid": None}
+        print(f"Account: {account_name}  (no spreadsheet — Multilogin profile only)")
 
     mlx, started = start_profile_for(account_name)
 
@@ -152,12 +158,14 @@ def open_account(path, account_name, sheet_name, manual):
                 page, valid = restore_session(context)
                 if not valid:
                     print("\nRun with --manual to log in first:")
-                    print(f'  python3 login.py "{path}" --account "{account_name}" --manual')
+                    print(f'  python3 login.py --account "{account_name}" --manual')
                     sys.exit(1)
 
-            profile_url = f"https://www.facebook.com/{creds['uid']}"
-            print(f"Opening profile: {profile_url}")
-            page.goto(profile_url, wait_until="domcontentloaded")
+            if creds["uid"]:
+                profile_url = f"https://www.facebook.com/{creds['uid']}"
+                print(f"Opening profile: {profile_url}")
+                page.evaluate(f"window.location.href = '{profile_url}'")
+                page.wait_for_load_state("domcontentloaded")
 
             print("\nBrowser is open. Close it when done.")
             try:
@@ -170,7 +178,7 @@ def open_account(path, account_name, sheet_name, manual):
 
 def main():
     parser = argparse.ArgumentParser(description="Open a Meta account from the spreadsheet.")
-    parser.add_argument("file",      help="Path to the .xlsx workbook")
+    parser.add_argument("file",      nargs="?", default=None, help="Path to the .xlsx workbook (optional when using mlx_profiles.json)")
     parser.add_argument("--account", required=True, help="Account name (e.g. NOS_PAN_001)")
     parser.add_argument("--sheet",   default="New VProfiles for BFL", help="Sheet name")
     parser.add_argument("--manual",  action="store_true", help="Log in manually (required first time or after session expires)")
