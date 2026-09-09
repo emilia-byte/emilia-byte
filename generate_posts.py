@@ -336,34 +336,41 @@ def generate_three_posts(category: str, url: str) -> tuple[list[str], list[str]]
 # ── Page name detection ───────────────────────────────────────────────────────
 
 def detect_page_name(page) -> str | None:
-    page.goto("https://www.facebook.com/", wait_until="domcontentloaded")
+    # Use window.location, not page.goto() — Playwright's own navigation bypasses
+    # Multilogin's proxy-auth injection and fails with ERR_INVALID_AUTH_CREDENTIALS.
+    page.evaluate("window.location.href = 'https://www.facebook.com/'")
+    page.wait_for_load_state("domcontentloaded")
     time.sleep(3)
 
-    selectors = [
-        "div[aria-label*='using Facebook as']",
-        "div:has-text('Using Facebook as') span[dir='auto']",
-        "span:has-text('You\\'re now using Facebook as')",
-        "[data-pagelet='LeftRail'] div[role='navigation'] span[dir='auto']",
-        "div[role='complementary'] span[dir='auto']",
-    ]
-
-    for selector in selectors:
+    # Scroll the left sidebar down so "Your shortcuts" / Pages section loads
+    for _ in range(4):
         try:
-            els = page.locator(selector).all()
-            for el in els:
-                text = (el.text_content() or "").strip()
-                if len(text) > 4 and text not in ("Home", "Search", "Menu"):
-                    return text
+            page.evaluate(
+                "document.querySelector('[data-pagelet=\"LeftRail\"]')?.scrollBy(0, 300)"
+            )
         except Exception:
-            continue
+            pass
+        time.sleep(0.7)
 
-    # Fallback: scan body text for known suffix patterns
+    # Scan all sidebar links for a known category suffix in their text
     try:
-        body = page.inner_text("body")
-        for suffix in CATEGORY_MAP:
-            match = re.search(rf'\b\w[\w\s]*{suffix}\b', body, re.IGNORECASE)
-            if match:
-                return match.group().strip()
+        links = page.locator("[data-pagelet='LeftRail'] a").all()
+        for link in links:
+            text = (link.text_content() or "").strip()
+            suffix, _ = extract_category(text)
+            if suffix:
+                return text
+    except Exception:
+        pass
+
+    # Fallback: scan all links on the page
+    try:
+        links = page.locator("a").all()
+        for link in links:
+            text = (link.text_content() or "").strip()
+            suffix, _ = extract_category(text)
+            if suffix:
+                return text
     except Exception:
         pass
 

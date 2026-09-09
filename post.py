@@ -376,9 +376,13 @@ def run(account_name, posts_path, min_delay=DEFAULT_MIN_DELAY, max_delay=DEFAULT
                 sys.exit(1)
 
             # Check if already in page context by looking at the composer placeholder
+            try:
+                main_text = page.locator("div[role='main']").first.text_content(timeout=8000) or ""
+            except Exception:
+                main_text = ""
             already_on_page = any(
                 re.search(rf'\b{s}\b', page.url, re.I) or
-                re.search(rf'\b{s}\b', (page.locator("div[role='main']").text_content() or ""), re.I)
+                re.search(rf'\b{s}\b', main_text, re.I)
                 for s in SUFFIXES
             )
 

@@ -11,9 +11,23 @@ browser_profiles/
 *.xlsx
 !BFL_Info_dummy.xlsx
 
+# Multilogin credentials (local-only, never commit)
+mlx_env.ps1
+
 # Generated post images (recreated by generate_posts.py each run)
 images/
 image_suggestions.txt
+
+# Credentials
+.env
+
+# Generated output
+*.pdf
+posts.txt
+
+# One-off generation scripts
+make_demo_brief.py
+make_arch_pdf.py
 
 # Python cache
 __pycache__/

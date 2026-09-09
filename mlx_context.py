@@ -3,19 +3,29 @@ Shared helper: sign into Multilogin, start a profile, and return
 (client, started_profile) ready for connect_over_cdp().
 
 Credentials come from environment variables MLX_EMAIL and MLX_PASSWORD.
-Profile IDs come from mlx_profiles.json next to this file.
+Profile UUIDs come from mlx_profiles.json next to this file.
+Run sync_profiles.py to auto-populate mlx_profiles.json from Multilogin.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 from pathlib import Path
 
 from multilogin_client import MultiloginClient
-from mlx_profiles import load_profile_map, validate_against
 
+FOLDER_ID = "5bfc9a9a-4d09-4988-ad84-2e2b0cf107c6"
 MLX_PROFILES_PATH = Path(__file__).parent / "mlx_profiles.json"
+
+
+def _load_profiles() -> dict[str, str]:
+    """Returns {profile_name: profile_uuid}."""
+    if not MLX_PROFILES_PATH.exists():
+        print(f"Error: {MLX_PROFILES_PATH} not found. Run sync_profiles.py first.")
+        sys.exit(1)
+    return json.loads(MLX_PROFILES_PATH.read_text())
 
 
 def _client() -> MultiloginClient:
@@ -29,20 +39,25 @@ def _client() -> MultiloginClient:
     return client
 
 
+def list_accounts() -> list[str]:
+    return sorted(_load_profiles().keys())
+
+
 def start_profile_for(account_name: str):
     """
-    Validate account against mlx_profiles.json, sign in, start the profile.
+    Look up profile UUID from mlx_profiles.json, sign in, start the profile.
     Returns (MultiloginClient, StartedProfile).
     Caller must call client.stop_profile(started.profile_id) when done.
     """
-    profile_map = load_profile_map(MLX_PROFILES_PATH)
-    errors = validate_against([account_name], profile_map)
-    if errors:
-        for e in errors:
-            print(f"MLX MAPPING ERROR: {e}")
+    profiles = _load_profiles()
+
+    if account_name not in profiles:
+        print(f"Error: '{account_name}' not found in mlx_profiles.json.")
+        print(f"Available: {sorted(profiles.keys())}")
+        print("Run sync_profiles.py to refresh the profile list.")
         sys.exit(1)
 
-    entry = profile_map[account_name]
+    profile_id = profiles[account_name]
     client = _client()
-    started = client.start_profile(entry["folder_id"], entry["profile_id"])
+    started = client.start_profile(FOLDER_ID, profile_id)
     return client, started

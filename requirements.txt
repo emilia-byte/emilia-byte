@@ -1,0 +1,6 @@
+playwright
+playwright-stealth
+requests
+openpyxl
+reportlab
+textverified

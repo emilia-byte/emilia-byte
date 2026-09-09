@@ -37,6 +37,7 @@ import hashlib
 import json
 import logging
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -71,6 +72,36 @@ def _clear_port_cache(profile_id: str) -> None:
 
 class MultiloginError(RuntimeError):
     """Raised when a Multilogin API call fails."""
+
+
+def _cdp_alive(port: int) -> bool:
+    """One-shot check: is something actually listening on this CDP port right now?"""
+    try:
+        return requests.get(f"http://127.0.0.1:{port}/json/version", timeout=2).ok
+    except requests.RequestException:
+        return False
+
+
+def _wait_for_cdp_ready(port: int, timeout: float = 20.0) -> None:
+    """
+    Multilogin's /start response returns a port before the underlying
+    Chromium process is actually listening on it. Poll the CDP endpoint
+    until it responds so callers don't hit ECONNREFUSED.
+    """
+    deadline = time.monotonic() + timeout
+    last_exc: Exception | None = None
+    while time.monotonic() < deadline:
+        try:
+            resp = requests.get(f"http://127.0.0.1:{port}/json/version", timeout=2)
+            if resp.ok:
+                return
+        except requests.RequestException as exc:
+            last_exc = exc
+        time.sleep(0.5)
+    raise MultiloginError(
+        f"Profile started but CDP port {port} never became ready within {timeout}s"
+        + (f" ({last_exc})" if last_exc else "")
+    )
 
 
 @dataclass
@@ -149,6 +180,7 @@ class MultiloginClient:
             raise MultiloginError(f"Unexpected start-profile response shape: {resp.text}") from exc
 
         log.info("Started Multilogin profile %s on port %s", profile_id, port)
+        _wait_for_cdp_ready(port)
         _save_port_cache(profile_id, port)
         return StartedProfile(profile_id=profile_id, port=port)
 
@@ -157,11 +189,14 @@ class MultiloginClient:
         import time
 
         cached_port = _load_port_cache().get(profile_id)
-        if cached_port:
+        if cached_port and _cdp_alive(cached_port):
             log.info("Profile %s already running — reconnecting on cached port %s", profile_id, cached_port)
             return StartedProfile(profile_id=profile_id, port=cached_port)
+        if cached_port:
+            log.info("Cached port %s for profile %s is stale — discarding", cached_port, profile_id)
+            _clear_port_cache(profile_id)
 
-        log.info("Profile %s already running — no cached port, stopping and restarting...", profile_id)
+        log.info("Profile %s already running — no live cached port, stopping and restarting...", profile_id)
         self.stop_profile(profile_id)
         time.sleep(2)
 
@@ -184,6 +219,7 @@ class MultiloginClient:
             raise MultiloginError(f"Unexpected restart response shape: {resp.text}") from exc
 
         log.info("Restarted profile %s on port %s", profile_id, port)
+        _wait_for_cdp_ready(port)
         _save_port_cache(profile_id, port)
         return StartedProfile(profile_id=profile_id, port=port)
 

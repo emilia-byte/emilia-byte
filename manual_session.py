@@ -38,7 +38,8 @@ def main():
             browser = p.chromium.connect_over_cdp(started.cdp_url)
             context = browser.contexts[0]
             page = context.pages[0] if context.pages else context.new_page()
-            page.goto("https://www.facebook.com/login", wait_until="domcontentloaded")
+            page.evaluate("window.location.href = 'https://www.facebook.com/login'")
+            page.wait_for_load_state("domcontentloaded")
 
             start = time.time()
             while time.time() - start < TIMEOUT:
