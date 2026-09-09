@@ -221,55 +221,135 @@ async def boost(cdp_url: str):
 
         # Current Ads Manager UI: modal shows objective radio buttons directly.
         # No "Manual campaign" step — just select Engagement and Continue.
-        await page.click("text=Engagement")
+        # Scope to the dialog: a bare "text=Engagement" can match a leftover
+        # draft campaign named "New Engagement Campaign" in the table behind
+        # the modal, which then hangs waiting to click through a side panel.
+        await page.click('div[role="dialog"] :text("Engagement")')
         await page.wait_for_timeout(800)
-        await page.click('button:has-text("Continue")')
-        await page.wait_for_load_state("networkidle")
+        continue_btn = page.locator('div[role="dialog"]').get_by_role(
+            "button", name=re.compile(r"^Continue$", re.I)
+        )
+        await continue_btn.click(timeout=10000)
+        await page.wait_for_timeout(1500)
+
+        # Second dialog: "Choose a campaign setup" — Recommended vs Manual.
+        # We want full manual control (targeting, post selection), not
+        # Advantage+ presets.
+        try:
+            await page.locator('div[role="dialog"] :text("Manual")').first.click(timeout=8000)
+            await page.wait_for_timeout(800)
+            manual_continue = page.locator('div[role="dialog"]').get_by_role(
+                "button", name=re.compile(r"^Continue$", re.I)
+            )
+            await manual_continue.click(timeout=8000)
+            await page.wait_for_timeout(1200)
+        except Exception:
+            pass  # some accounts may skip straight past this dialog
+
+        # Single-page campaign editor (Campaign name / details / Budget) —
+        # click Next to move to the Ad set section. Not a real <button>.
+        next_btn = page.get_by_role("button", name=re.compile(r"^Next$", re.I))
+        await next_btn.click(timeout=10000)
+        await page.wait_for_timeout(1500)
 
         # ── Ad set ────────────────────────────────────────────────
         print("Configuring ad set...")
-        await page.click("text=On your ad")
-        await page.wait_for_timeout(800)
-        await page.click("text=Post engagement")
-        await page.wait_for_timeout(800)
+        # "Conversion location" dropdown replaces the old standalone
+        # "On your ad" / "Post engagement" clicks.
+        await page.click("text=Message destinations", timeout=10000)
+        await page.wait_for_timeout(600)
+        await page.click('text="On your ad"', timeout=8000)
+        await page.wait_for_timeout(1000)
 
-        # Location targeting
+        # "Engagement type" dropdown defaults to "Video views" — switch to
+        # "Post engagement" since our posts are image/text, not video.
+        try:
+            await page.click("text=Video views", timeout=8000)
+            await page.wait_for_timeout(600)
+            await page.click("text=Post engagement", timeout=5000)
+            await page.wait_for_timeout(800)
+        except Exception:
+            pass  # already set, or account defaults differently
+
+        # Location targeting lives inside "Audience controls", collapsed by
+        # default. Scroll it into view with the mouse wheel — the panel is a
+        # virtualized scroll container, so JS window.scrollBy and Playwright's
+        # scroll_into_view_if_needed() don't reach it.
         print("Setting location: Paraguay...")
         try:
-            await page.click('div[aria-label="Remove United States"]', timeout=5000)
-            await page.wait_for_timeout(500)
+            box = await page.locator("text=Cost per result goal").first.bounding_box()
+            if box:
+                await page.mouse.move(box["x"] + 50, box["y"] + 10)
+            for _ in range(10):
+                await page.mouse.wheel(0, 250)
+                await page.wait_for_timeout(350)
+                adv = page.locator("text=Advantage+ audience").first
+                if await adv.count() > 0 and await adv.is_visible():
+                    break
         except Exception:
             pass
 
-        loc = await page.wait_for_selector('input[aria-label="Add locations"]', timeout=10000)
-        await loc.fill("Paraguay")
-        await page.wait_for_selector('div[role="option"]:has-text("Paraguay")', timeout=10000)
-        await page.click('div[role="option"]:has-text("Paraguay")')
-        await page.wait_for_timeout(800)
+        # The "* Locations" summary has its own "Edit" link (not the page's
+        # "Show more options", which expands age/gender instead).
+        included = page.locator("text=Included location:").first
+        inc_box = await included.bounding_box()
+        edit_candidates = await page.locator('text="Edit"').all()
+        best, best_dy = None, None
+        for c in edit_candidates:
+            cbox = await c.bounding_box()
+            if cbox and inc_box and cbox["y"] > inc_box["y"]:
+                dy = cbox["y"] - inc_box["y"]
+                if best_dy is None or dy < best_dy:
+                    best_dy, best = dy, c
+        if best is None:
+            raise RuntimeError("Could not find the Locations 'Edit' link.")
+        await best.click(timeout=8000)
+        await page.wait_for_timeout(1000)
 
-        await page.click('button:has-text("Next")')
+        search = None
+        for sel in [
+            'input[placeholder*="ountry" i]',
+            'input[placeholder*="ocation" i]',
+            'input[aria-label*="ocation" i]',
+            'div[role="dialog"] input[type="text"]',
+        ]:
+            try:
+                cand = page.locator(sel).first
+                if await cand.is_visible(timeout=2000):
+                    search = cand
+                    break
+            except Exception:
+                continue
+        if not search:
+            raise RuntimeError("No location search input found after clicking Edit.")
+        await search.fill("Paraguay")
+        await page.wait_for_timeout(1000)
+        # Press Enter rather than clicking a result row — "Paraguay" also
+        # substring-matches city results ("Asunción, Paraguay" etc.), so a
+        # has-text click is ambiguous. Enter takes the top (country) match.
+        await search.press("Enter")
+        await page.wait_for_timeout(1000)
+
+        next_btn2 = page.get_by_role("button", name=re.compile(r"^Next$", re.I))
+        await next_btn2.click(timeout=10000)
         await page.wait_for_load_state("networkidle")
 
-        # ── Ad level: select existing post ────────────────────────
+        # ── Ad level: select most recent post ─────────────────────
         print("Selecting most recent post...")
         await page.click("text=Use existing post")
         await page.wait_for_timeout(1000)
         await page.click("text=Select post")
         await page.wait_for_timeout(2000)
 
-        first_post = await page.wait_for_selector(
-            'div[data-testid="mw-media-grid-item"]:first-child, div[role="gridcell"]:first-child',
-            timeout=15000,
-        )
-        await first_post.click()
+        # "Select post" is a table (Facebook post / Post ID / Source / Media
+        # / Date created), sorted newest first — not a media grid. The first
+        # numeric Post ID cell is the most recent post.
+        first_post_id = page.locator("text=/^\\d{15,}$/").first
+        await first_post_id.click(timeout=15000)
         await page.wait_for_timeout(1000)
 
-        for label in ["Continue", "Select"]:
-            try:
-                await page.click(f'button:has-text("{label}")', timeout=4000)
-                break
-            except Exception:
-                continue
+        continue_post_btn = page.get_by_role("button", name=re.compile(r"^Continue$", re.I))
+        await continue_post_btn.click(timeout=8000)
         await page.wait_for_load_state("networkidle")
 
         # ── Publish ───────────────────────────────────────────────
