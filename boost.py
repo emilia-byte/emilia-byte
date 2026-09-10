@@ -383,14 +383,19 @@ async def boost(cdp_url: str):
 
         # ── Ad level: select most recent post ─────────────────────
         print("Selecting most recent post...")
-        # Scroll position carries over from the Ad Set page, so "Use
-        # existing post" can start off-screen above the current view.
+        # Scroll position carries over from the Ad Set page. On some
+        # accounts the "Ad setup" dropdown's own text isn't a reliable
+        # scroll target -- its closed-state value is duplicated elsewhere
+        # in the DOM as a permanently display:none legacy node (same
+        # text, but genuinely no layout box, so scrollIntoView on *that*
+        # copy is a no-op and the real one never gets its own scroll).
+        # The "Ad setup" heading right above it doesn't have that problem.
         try:
-            use_existing = page.locator("text=Use existing post").first
-            await use_existing.wait_for(state="attached", timeout=8000)
-            handle = await use_existing.element_handle()
+            ad_setup_heading = page.locator("text=Ad setup").first
+            await ad_setup_heading.wait_for(state="attached", timeout=8000)
+            handle = await ad_setup_heading.element_handle()
             await page.evaluate(
-                "el => el.scrollIntoView({block: 'center', behavior: 'instant'})",
+                "el => el.scrollIntoView({block: 'start', behavior: 'instant'})",
                 handle,
             )
             await page.wait_for_timeout(500)
