@@ -367,7 +367,12 @@ def run(account_name, posts_path, min_delay=DEFAULT_MIN_DELAY, max_delay=DEFAULT
             print("\nChecking session...")
             SUFFIXES = ["LS", "HOB", "CSI", "MF"]
 
-            if "facebook.com" not in page.url:
+            # "facebook.com" alone also matches adsmanager.facebook.com,
+            # business.facebook.com, etc. — a profile left open on one of
+            # those from a prior session would be wrongly treated as
+            # already on the main feed, and the composer search below
+            # would fail against the wrong page entirely.
+            if "www.facebook.com" not in page.url:
                 js_navigate(page, "https://www.facebook.com/")
                 human_pause(2.0, 3.0)
 
