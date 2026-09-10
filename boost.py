@@ -179,12 +179,19 @@ async def boost(cdp_url: str):
         page = context.pages[0] if context.pages else await context.new_page()
 
         # ── Navigate to Ads Manager ───────────────────────────────
+        # Use window.location, not page.goto() — Playwright's own navigation
+        # bypasses Multilogin's proxy-auth injection and fails with
+        # ERR_INVALID_AUTH_CREDENTIALS.
         print("Opening Ads Manager...")
-        await page.goto(
-            "https://adsmanager.facebook.com/adsmanager/manage/campaigns",
-            wait_until="networkidle",
-            timeout=60000,
+        await page.evaluate(
+            "window.location.href = 'https://adsmanager.facebook.com/adsmanager/manage/campaigns'"
         )
+        await page.wait_for_load_state("domcontentloaded", timeout=30000)
+        try:
+            await page.wait_for_selector("text=Campaigns", timeout=30000)
+        except Exception:
+            pass
+        await page.wait_for_timeout(2000)
 
         # ── Create campaign ───────────────────────────────────────
         print("Creating campaign...")
@@ -218,6 +225,14 @@ async def boost(cdp_url: str):
         if not clicked:
             raise RuntimeError("Could not find the + Create campaign button in Ads Manager.")
         await page.wait_for_timeout(1500)
+
+        # Some accounts show a "Loading creation..." spinner before the
+        # objective modal actually renders — wait it out or the Engagement
+        # click below can land before the dialog content exists.
+        try:
+            await page.wait_for_selector("text=Loading creation", state="hidden", timeout=20000)
+        except Exception:
+            pass
 
         # Current Ads Manager UI: modal shows objective radio buttons directly.
         # No "Manual campaign" step — just select Engagement and Continue.
@@ -271,36 +286,68 @@ async def boost(cdp_url: str):
         except Exception:
             pass  # already set, or account defaults differently
 
-        # Location targeting lives inside "Audience controls", collapsed by
-        # default. Scroll it into view with the mouse wheel — the panel is a
-        # virtualized scroll container, so JS window.scrollBy and Playwright's
-        # scroll_into_view_if_needed() don't reach it.
+        # Location targeting lives inside "Audience controls", not rendered
+        # until scrolled near — some accounts' Ad Set page isn't virtualized
+        # (the section exists in the DOM immediately) and some accounts'
+        # is (it only attaches once scrolled close), so scroll by mouse
+        # wheel checking cheap DOM-presence rather than full visibility,
+        # then do a precise native scrollIntoView once it's attached.
         print("Setting location: Paraguay...")
-        try:
-            box = await page.locator("text=Cost per result goal").first.bounding_box()
-            if box:
-                await page.mouse.move(box["x"] + 50, box["y"] + 10)
-            for _ in range(10):
-                await page.mouse.wheel(0, 250)
-                await page.wait_for_timeout(350)
-                adv = page.locator("text=Advantage+ audience").first
-                if await adv.count() > 0 and await adv.is_visible():
-                    break
-        except Exception:
-            pass
+        box = await page.locator("text=Conversion").first.bounding_box()
+        if box:
+            await page.mouse.move(box["x"] + 50, box["y"] + 10)
 
-        # The "* Locations" summary has its own "Edit" link (not the page's
-        # "Show more options", which expands age/gender instead).
         included = page.locator("text=Included location:").first
-        inc_box = await included.bounding_box()
-        edit_candidates = await page.locator('text="Edit"').all()
-        best, best_dy = None, None
-        for c in edit_candidates:
-            cbox = await c.bounding_box()
-            if cbox and inc_box and cbox["y"] > inc_box["y"]:
-                dy = cbox["y"] - inc_box["y"]
-                if best_dy is None or dy < best_dy:
-                    best_dy, best = dy, c
+        attached = False
+        for _ in range(30):
+            if await included.count() > 0:
+                attached = True
+                break
+            await page.mouse.wheel(0, 150)
+            await page.wait_for_timeout(250)
+        if not attached:
+            raise RuntimeError("Never reached the Locations section.")
+
+        inc_handle = await included.element_handle()
+        await page.evaluate(
+            "el => el.scrollIntoView({block: 'center', behavior: 'instant'})",
+            inc_handle,
+        )
+        await page.wait_for_timeout(800)
+
+        # The "* Locations" heading row carries its own "Edit" link (not
+        # the page's "Show more options", which expands age/gender
+        # instead) — but on some accounts it only renders after the
+        # location chip itself is clicked to "activate" the box. Anchor
+        # proximity search on the heading, not "Included location:" — the
+        # Edit link sits level with the heading, above the location list.
+        inc_box = await included.bounding_box(timeout=10000)
+        heading_box = await page.locator("text=* Locations").first.bounding_box()
+        anchor_box = heading_box or inc_box
+
+        def nearest_below(label):
+            async def _find():
+                candidates = await page.locator(label).all()
+                best, best_dy = None, None
+                for c in candidates:
+                    cbox = await c.bounding_box()
+                    if cbox and anchor_box and cbox["y"] >= anchor_box["y"] - 5:
+                        dy = cbox["y"] - anchor_box["y"]
+                        if best_dy is None or dy < best_dy:
+                            best_dy, best = dy, c
+                return best
+            return _find()
+
+        best = await nearest_below('text="Edit"')
+        if best is None:
+            # Clicking anywhere in the location summary "activates" the box
+            # and reveals its Edit link on some accounts.
+            try:
+                await included.click(timeout=5000)
+                await page.wait_for_timeout(800)
+                best = await nearest_below('text="Edit"')
+            except Exception:
+                pass
         if best is None:
             raise RuntimeError("Could not find the Locations 'Edit' link.")
         await best.click(timeout=8000)
@@ -336,6 +383,19 @@ async def boost(cdp_url: str):
 
         # ── Ad level: select most recent post ─────────────────────
         print("Selecting most recent post...")
+        # Scroll position carries over from the Ad Set page, so "Use
+        # existing post" can start off-screen above the current view.
+        try:
+            use_existing = page.locator("text=Use existing post").first
+            await use_existing.wait_for(state="attached", timeout=8000)
+            handle = await use_existing.element_handle()
+            await page.evaluate(
+                "el => el.scrollIntoView({block: 'center', behavior: 'instant'})",
+                handle,
+            )
+            await page.wait_for_timeout(500)
+        except Exception:
+            pass
         await page.click("text=Use existing post")
         await page.wait_for_timeout(1000)
         await page.click("text=Select post")
