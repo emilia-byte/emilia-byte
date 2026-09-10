@@ -48,26 +48,30 @@ log = logging.getLogger(__name__)
 AUTH_BASE = "https://api.multilogin.com"
 LAUNCHER_BASE = "https://launcher.mlx.yt:45001"
 
-_PORT_CACHE = Path(tempfile.gettempdir()) / "mlx_running_ports.json"
+_PORT_CACHE_DIR = Path(tempfile.gettempdir()) / "mlx_ports"
 
 
-def _load_port_cache() -> dict:
+def _port_cache_path(profile_id: str) -> Path:
+    return _PORT_CACHE_DIR / f"{profile_id}.json"
+
+
+def _load_port_cache(profile_id: str) -> int | None:
+    """One file per profile -- concurrent post.py/boost.py runs on
+    different profiles never touch the same file, so there's no
+    read-modify-write race to guard against."""
     try:
-        return json.loads(_PORT_CACHE.read_text())
+        return json.loads(_port_cache_path(profile_id).read_text())["port"]
     except Exception:
-        return {}
+        return None
 
 
 def _save_port_cache(profile_id: str, port: int) -> None:
-    cache = _load_port_cache()
-    cache[profile_id] = port
-    _PORT_CACHE.write_text(json.dumps(cache))
+    _PORT_CACHE_DIR.mkdir(exist_ok=True)
+    _port_cache_path(profile_id).write_text(json.dumps({"port": port}))
 
 
 def _clear_port_cache(profile_id: str) -> None:
-    cache = _load_port_cache()
-    cache.pop(profile_id, None)
-    _PORT_CACHE.write_text(json.dumps(cache))
+    _port_cache_path(profile_id).unlink(missing_ok=True)
 
 
 class MultiloginError(RuntimeError):
@@ -188,7 +192,7 @@ class MultiloginClient:
         """Reconnect to an already-running profile using the cached port, or restart it."""
         import time
 
-        cached_port = _load_port_cache().get(profile_id)
+        cached_port = _load_port_cache(profile_id)
         if cached_port and _cdp_alive(cached_port):
             log.info("Profile %s already running — reconnecting on cached port %s", profile_id, cached_port)
             return StartedProfile(profile_id=profile_id, port=cached_port)
