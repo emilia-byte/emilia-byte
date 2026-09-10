@@ -189,9 +189,15 @@ class MultiloginClient:
         return StartedProfile(profile_id=profile_id, port=port)
 
     def _get_running_profile(self, profile_id: str, folder_id: str, headless: bool) -> StartedProfile:
-        """Reconnect to an already-running profile using the cached port, or restart it."""
-        import time
-
+        """
+        Reconnect to an already-running profile using this machine's cached
+        port. Never stop-and-restart on a miss: with a team sharing
+        Multilogin accounts, a profile that's "already running" with no
+        live port in *our* local cache is most likely running on someone
+        else's machine right now, not a stale leftover of our own. Stopping
+        it would yank the browser out from under whoever is actually using
+        it -- so we fail loudly instead and let a human decide.
+        """
         cached_port = _load_port_cache(profile_id)
         if cached_port and _cdp_alive(cached_port):
             log.info("Profile %s already running — reconnecting on cached port %s", profile_id, cached_port)
@@ -200,32 +206,13 @@ class MultiloginClient:
             log.info("Cached port %s for profile %s is stale — discarding", cached_port, profile_id)
             _clear_port_cache(profile_id)
 
-        log.info("Profile %s already running — no live cached port, stopping and restarting...", profile_id)
-        self.stop_profile(profile_id)
-        time.sleep(2)
-
-        url = (
-            f"{LAUNCHER_BASE}/api/v2/profile/f/{folder_id}/p/{profile_id}/start"
-            f"?automation_type=playwright&headless_mode={'true' if headless else 'false'}"
+        raise MultiloginError(
+            f"Profile {profile_id} is already running but not on a port cached on this "
+            f"machine -- it's likely in use by another teammate right now. Refusing to "
+            f"stop or restart it. If you're certain it's a stale session of your own "
+            f"(e.g. this machine crashed while it was running), stop it manually in the "
+            f"Multilogin app first, then try again."
         )
-        resp = requests.get(
-            url,
-            headers={"Authorization": f"Bearer {self._token}"},
-            timeout=30,
-        )
-        if not resp.ok:
-            raise MultiloginError(
-                f"Failed to restart profile {profile_id} ({resp.status_code}): {resp.text}"
-            )
-        try:
-            port = resp.json()["data"]["port"]
-        except (KeyError, ValueError) as exc:
-            raise MultiloginError(f"Unexpected restart response shape: {resp.text}") from exc
-
-        log.info("Restarted profile %s on port %s", profile_id, port)
-        _wait_for_cdp_ready(port)
-        _save_port_cache(profile_id, port)
-        return StartedProfile(profile_id=profile_id, port=port)
 
     def stop_profile(self, profile_id: str) -> None:
         """Stop a running profile. Logs a warning rather than raising so it's safe in a finally block."""
