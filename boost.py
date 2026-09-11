@@ -184,7 +184,8 @@ async def boost(cdp_url: str):
         # ERR_INVALID_AUTH_CREDENTIALS.
         print("Opening Ads Manager...")
         await page.evaluate(
-            "window.location.href = 'https://adsmanager.facebook.com/adsmanager/manage/campaigns'"
+            "(u) => { window.location.href = u; }",
+            "https://adsmanager.facebook.com/adsmanager/manage/campaigns",
         )
         await page.wait_for_load_state("domcontentloaded", timeout=30000)
         try:

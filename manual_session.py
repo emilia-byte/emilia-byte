@@ -18,6 +18,7 @@ import time
 from playwright.sync_api import sync_playwright
 
 from mlx_context import start_profile_for
+from fb_dom import js_navigate
 
 TIMEOUT = 600  # 10 minutes
 
@@ -38,8 +39,7 @@ def main():
             browser = p.chromium.connect_over_cdp(started.cdp_url)
             context = browser.contexts[0]
             page = context.pages[0] if context.pages else context.new_page()
-            page.evaluate("window.location.href = 'https://www.facebook.com/login'")
-            page.wait_for_load_state("domcontentloaded")
+            js_navigate(page, "https://www.facebook.com/login")
 
             start = time.time()
             while time.time() - start < TIMEOUT:

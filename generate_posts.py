@@ -32,6 +32,7 @@ import requests
 from playwright.sync_api import sync_playwright
 
 from mlx_context import start_profile_for
+from fb_dom import js_navigate
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -338,8 +339,7 @@ def generate_three_posts(category: str, url: str) -> tuple[list[str], list[str]]
 def detect_page_name(page) -> str | None:
     # Use window.location, not page.goto() — Playwright's own navigation bypasses
     # Multilogin's proxy-auth injection and fails with ERR_INVALID_AUTH_CREDENTIALS.
-    page.evaluate("window.location.href = 'https://www.facebook.com/'")
-    page.wait_for_load_state("domcontentloaded")
+    js_navigate(page, "https://www.facebook.com/")
     time.sleep(3)
 
     # Scroll the left sidebar down so "Your shortcuts" / Pages section loads

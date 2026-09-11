@@ -27,6 +27,7 @@ from pathlib import Path
 from playwright.sync_api import sync_playwright
 
 from mlx_context import start_profile_for
+from fb_dom import js_navigate
 
 DEFAULT_MIN_DELAY = 45
 DEFAULT_MAX_DELAY = 90
@@ -273,12 +274,6 @@ def attach_image(page, image_path: Path) -> bool:
 
     print("Could not attach image — photo button not found.")
     return False
-
-
-def js_navigate(page, url):
-    """Navigate using window.location so Multilogin's proxy handles auth correctly."""
-    page.evaluate(f"window.location.href = '{url}'")
-    page.wait_for_load_state("domcontentloaded")
 
 
 def publish_post(page, post, index, page_url="https://www.facebook.com/", image_path=None, navigate=True):

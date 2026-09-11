@@ -34,6 +34,7 @@ from openpyxl import load_workbook
 from playwright.sync_api import sync_playwright
 
 from mlx_context import start_profile_for
+from fb_dom import js_navigate
 
 SHEET_LAYOUTS = {
     "New VProfiles for BFL": {
@@ -106,8 +107,7 @@ def manual_login(context):
     print("→ Log in as usual (email, password, 2FA, any checkpoints).")
     print("→ The script will detect when you're done. Multilogin saves the session automatically.\n")
 
-    page.evaluate("window.location.href = 'https://www.facebook.com/login'")
-    page.wait_for_load_state("domcontentloaded")
+    js_navigate(page, "https://www.facebook.com/login")
 
     timeout = 300
     start = time.time()
@@ -125,8 +125,7 @@ def restore_session(context):
     page = context.pages[0] if context.pages else context.new_page()
 
     print("Checking session...")
-    page.evaluate("window.location.href = 'https://www.facebook.com/'")
-    page.wait_for_load_state("domcontentloaded")
+    js_navigate(page, "https://www.facebook.com/")
     time.sleep(2)
 
     if "login" in page.url:
@@ -164,8 +163,7 @@ def open_account(path, account_name, sheet_name, manual):
             if creds["uid"]:
                 profile_url = f"https://www.facebook.com/{creds['uid']}"
                 print(f"Opening profile: {profile_url}")
-                page.evaluate(f"window.location.href = '{profile_url}'")
-                page.wait_for_load_state("domcontentloaded")
+                js_navigate(page, profile_url)
 
             print("\nBrowser is open. Close it when done.")
             try:
