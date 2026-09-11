@@ -67,7 +67,10 @@ def _load_port_cache(profile_id: str) -> int | None:
 
 def _save_port_cache(profile_id: str, port: int) -> None:
     _PORT_CACHE_DIR.mkdir(exist_ok=True)
-    _port_cache_path(profile_id).write_text(json.dumps({"port": port}))
+    path = _port_cache_path(profile_id)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps({"port": port}))
+    tmp.replace(path)  # atomic on both POSIX and Windows -- no partial-write window
 
 
 def _clear_port_cache(profile_id: str) -> None:
