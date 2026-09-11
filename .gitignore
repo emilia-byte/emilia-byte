@@ -28,6 +28,9 @@ posts.txt
 # Runtime state: which post.py published, for boost.py to verify against
 last_post.json
 
+# Runtime state: last-used destination URL, remembered between generate_posts.py runs
+current_url.json
+
 # One-off generation scripts
 make_demo_brief.py
 make_arch_pdf.py

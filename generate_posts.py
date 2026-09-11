@@ -20,6 +20,7 @@ Requirements:
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import random
@@ -50,6 +51,48 @@ DEFAULT_URL = "https://visioncompassdesk.com"
 POSTS_PATH   = Path(__file__).parent / "posts.txt"
 IMAGES_PATH  = Path(__file__).parent / "image_suggestions.txt"
 IMAGES_DIR   = Path(__file__).parent / "images"
+CURRENT_URL_PATH = Path(__file__).parent / "current_url.json"
+
+
+def _load_current_url() -> str:
+    if CURRENT_URL_PATH.exists():
+        try:
+            data = json.loads(CURRENT_URL_PATH.read_text())
+            url = (data.get("url") or "").strip()
+            if url:
+                return url
+        except Exception as exc:
+            log.debug("could not read current_url.json: %s", exc)
+    return DEFAULT_URL
+
+
+def _save_current_url(url: str) -> None:
+    CURRENT_URL_PATH.write_text(json.dumps({"url": url}, indent=2))
+
+
+def resolve_url(cli_url: str | None) -> str:
+    """
+    Decide which URL goes in the first post. The destination rotates from
+    time to time, so this isn't just a fixed default: --url on the command
+    line wins outright and becomes the new remembered URL for next time,
+    same as typing a new one at the prompt. With no --url, prompts
+    interactively showing whatever URL was used last, so runs that keep
+    reusing the same link for weeks are just pressing Enter, and a run
+    that's rotating to a new one is a paste.
+    """
+    if cli_url:
+        _save_current_url(cli_url)
+        return cli_url
+
+    current = _load_current_url()
+    print("\n── Destination URL ───────────────────────────────────────")
+    print(f"  Current: {current}")
+    choice = input("  Press Enter to keep it, or paste a new URL: ").strip()
+    if choice:
+        _save_current_url(choice)
+        return choice
+    return current
+
 
 # ── Template bank ─────────────────────────────────────────────────────────────
 
@@ -432,7 +475,8 @@ def write_images_txt(images: list[str]) -> None:
 def main():
     parser = argparse.ArgumentParser(description="Generate Facebook posts from templates.")
     parser.add_argument("--account",  required=True, help="Account name (must match mlx_profiles.json)")
-    parser.add_argument("--url",      default=DEFAULT_URL, help="URL to include in the first post")
+    parser.add_argument("--url",      default=None,
+                        help="URL to include in the first post (skips the prompt if given)")
     parser.add_argument("--category", default=None,
                         help="Force category (LS, HOB, CSI, MF) — skips browser detection")
     args = parser.parse_args()
@@ -478,9 +522,12 @@ def main():
 
         print(f"Category: {category} ({suffix})")
 
+    # ── Resolve destination URL ─────────────────────────────────────────────
+    url = resolve_url(args.url)
+
     # ── Generate and save ──────────────────────────────────────────────────
     print(f"\nGenerating 3 posts for: {category}...")
-    posts, image_prompts = generate_three_posts(category, args.url)
+    posts, image_prompts = generate_three_posts(category, url)
 
     write_posts_txt(posts)
     write_images_txt(image_prompts)
