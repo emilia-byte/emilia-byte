@@ -212,6 +212,72 @@ async def _handle_verification(page) -> bool:
         return True
 
 
+# ── Post-selection matching ───────────────────────────────────────────────────
+
+async def select_target_post(page, account: str) -> str | None:
+    """
+    Called with the Ads Manager "Select post" table already open and its
+    rows rendered (a table of Facebook post / Post ID / Source / Media /
+    Date created, sorted newest first -- not a media grid). Clicks the row
+    matching post.py's recorded post ID when it can verify one; otherwise
+    falls back to the newest (first) row and prints a loud warning so the
+    mismatch isn't silent.
+
+    Returns the post ID actually clicked (best-effort -- None if even the
+    fallback row's text couldn't be read). Factored out of boost() so this
+    logic can be exercised directly against a DOM fixture in tests, without
+    having to drive Facebook's Ads Manager end to end.
+    """
+    last_post = _load_last_post(account)
+    target_post_id = last_post.get("post_id") if last_post else None
+    # The table only ever shows the legacy numeric ID scheme -- an opaque
+    # pfbid token (which post.py may have captured instead) can't be
+    # matched here, so don't pretend a non-numeric ID is verifiable.
+    if target_post_id and not re.fullmatch(r"\d{15,}", target_post_id):
+        print(
+            f"  NOTE: recorded post ID {target_post_id!r} isn't the numeric "
+            f"scheme this table uses — can't verify it here."
+        )
+        target_post_id = None
+
+    candidate_rows = page.locator("text=/^\\d{15,}$/")
+    chosen = None
+    if target_post_id:
+        exact = candidate_rows.filter(has_text=re.compile(rf"^{re.escape(target_post_id)}$"))
+        if await exact.count() > 0:
+            chosen = exact.first
+            print(f"  Matched recorded post ID {target_post_id} exactly.")
+        else:
+            print(
+                f"  WARNING: post.py recorded post ID {target_post_id} but it doesn't "
+                f"appear in this table (ID scheme mismatch, or the post isn't indexed "
+                f"here yet). Falling back to the newest row — verify this is the right "
+                f"post before confirming Publish."
+            )
+    elif last_post is not None:
+        print(
+            f"  WARNING: post.py's recorded post has no usable numeric ID "
+            f"(published_at={last_post.get('published_at')}). Falling back to the "
+            f"newest row in this table — verify it matches before confirming Publish."
+        )
+    else:
+        print(
+            "  WARNING: no record from post.py for this account (missing or stale) — "
+            "cannot verify which post this is. Falling back to the newest row in this "
+            "table — verify it matches before confirming Publish."
+        )
+
+    if chosen is None:
+        chosen = candidate_rows.first
+
+    await chosen.click(timeout=15000)
+    try:
+        return (await chosen.text_content() or "").strip()
+    except Exception as exc:
+        log.debug("could not read clicked row's text after selection: %s", exc)
+        return None
+
+
 # ── Main ad creation flow ─────────────────────────────────────────────────────
 
 async def boost(cdp_url: str, account: str):
@@ -454,53 +520,10 @@ async def boost(cdp_url: str, account: str):
         await page.wait_for_timeout(2000)
 
         # "Select post" is a table (Facebook post / Post ID / Source / Media
-        # / Date created), sorted newest first — not a media grid. Rather than
-        # blindly trusting the first row (a race against anything else that
-        # posts between post.py finishing and this running), try to match the
-        # post ID post.py actually recorded, and fall back loudly if we can't.
-        last_post = _load_last_post(account)
-        target_post_id = last_post.get("post_id") if last_post else None
-        # The table only ever shows the legacy numeric ID scheme -- an opaque
-        # pfbid token (which post.py may have captured instead) can't be
-        # matched here, so don't pretend a non-numeric ID is verifiable.
-        if target_post_id and not re.fullmatch(r"\d{15,}", target_post_id):
-            print(
-                f"  NOTE: recorded post ID {target_post_id!r} isn't the numeric "
-                f"scheme this table uses — can't verify it here."
-            )
-            target_post_id = None
-
-        candidate_rows = page.locator("text=/^\\d{15,}$/")
-        chosen = None
-        if target_post_id:
-            exact = candidate_rows.filter(has_text=re.compile(rf"^{re.escape(target_post_id)}$"))
-            if await exact.count() > 0:
-                chosen = exact.first
-                print(f"  Matched recorded post ID {target_post_id} exactly.")
-            else:
-                print(
-                    f"  WARNING: post.py recorded post ID {target_post_id} but it doesn't "
-                    f"appear in this table (ID scheme mismatch, or the post isn't indexed "
-                    f"here yet). Falling back to the newest row — verify this is the right "
-                    f"post before confirming Publish."
-                )
-        elif last_post is not None:
-            print(
-                f"  WARNING: post.py's recorded post has no usable numeric ID "
-                f"(published_at={last_post.get('published_at')}). Falling back to the "
-                f"newest row in this table — verify it matches before confirming Publish."
-            )
-        else:
-            print(
-                "  WARNING: no record from post.py for this account (missing or stale) — "
-                "cannot verify which post this is. Falling back to the newest row in this "
-                "table — verify it matches before confirming Publish."
-            )
-
-        if chosen is None:
-            chosen = candidate_rows.first
-
-        await chosen.click(timeout=15000)
+        # / Date created), sorted newest first — not a media grid. select_target_post()
+        # tries to match the post ID post.py actually recorded instead of blindly
+        # trusting the first (newest) row, and falls back loudly if it can't.
+        await select_target_post(page, account)
         await page.wait_for_timeout(1000)
 
         continue_post_btn = page.get_by_role("button", name=re.compile(r"^Continue$", re.I))
