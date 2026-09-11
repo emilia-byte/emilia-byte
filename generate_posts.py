@@ -20,6 +20,7 @@ Requirements:
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 import random
 import re
@@ -33,6 +34,8 @@ from playwright.sync_api import sync_playwright
 
 from mlx_context import start_profile_for
 from fb_dom import js_navigate
+
+log = logging.getLogger(__name__)
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -348,8 +351,8 @@ def detect_page_name(page) -> str | None:
             page.evaluate(
                 "document.querySelector('[data-pagelet=\"LeftRail\"]')?.scrollBy(0, 300)"
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            log.debug("sidebar scroll failed: %s", exc)
         time.sleep(0.7)
 
     # Scan all sidebar links for a known category suffix in their text
@@ -360,8 +363,8 @@ def detect_page_name(page) -> str | None:
             suffix, _ = extract_category(text)
             if suffix:
                 return text
-    except Exception:
-        pass
+    except Exception as exc:
+        log.debug("sidebar link scan failed: %s", exc)
 
     # Fallback: scan all links on the page
     try:
@@ -371,8 +374,8 @@ def detect_page_name(page) -> str | None:
             suffix, _ = extract_category(text)
             if suffix:
                 return text
-    except Exception:
-        pass
+    except Exception as exc:
+        log.debug("full-page link scan failed: %s", exc)
 
     return None
 

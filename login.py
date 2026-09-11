@@ -27,6 +27,7 @@ Requirements:
 """
 
 import argparse
+import logging
 import sys
 import time
 
@@ -35,6 +36,8 @@ from playwright.sync_api import sync_playwright
 
 from mlx_context import start_profile_for
 from fb_dom import js_navigate
+
+log = logging.getLogger(__name__)
 
 SHEET_LAYOUTS = {
     "New VProfiles for BFL": {
@@ -168,8 +171,8 @@ def open_account(path, account_name, sheet_name, manual):
             print("\nBrowser is open. Close it when done.")
             try:
                 page.wait_for_event("close", timeout=0)
-            except Exception:
-                pass
+            except Exception as exc:
+                log.debug("wait_for_event(close) ended: %s", exc)
         finally:
             mlx.stop_profile(started.profile_id)
 
