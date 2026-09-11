@@ -25,6 +25,9 @@ image_suggestions.txt
 *.pdf
 posts.txt
 
+# Runtime state: which post.py published, for boost.py to verify against
+last_post.json
+
 # One-off generation scripts
 make_demo_brief.py
 make_arch_pdf.py
