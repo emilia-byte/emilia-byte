@@ -17,11 +17,14 @@ Requirements:
 """
 
 import argparse
+import json
+import logging
 import os
 import random
 import re
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 from playwright.sync_api import sync_playwright
@@ -29,8 +32,12 @@ from playwright.sync_api import sync_playwright
 from mlx_context import start_profile_for
 from fb_dom import js_navigate
 
+log = logging.getLogger(__name__)
+
 DEFAULT_MIN_DELAY = 45
 DEFAULT_MAX_DELAY = 90
+
+LAST_POST_PATH = Path(__file__).parent / "last_post.json"
 
 
 def parse_posts(path):
@@ -113,16 +120,18 @@ def open_composer(page):
                         page.wait_for_selector(confirm, timeout=5000)
                         human_pause(1.0, 1.5)
                         return True
-                    except Exception:
+                    except Exception as exc:
+                        log.debug("composer confirm selector %r not found: %s", confirm, exc)
                         continue
-        except Exception:
+        except Exception as exc:
+            log.debug("composer open selector %r failed: %s", selector, exc)
             continue
 
     try:
         page.screenshot(path=os.path.join(os.path.dirname(__file__), "debug_composer.png"))
         print("Composer not found. Screenshot saved to debug_composer.png")
-    except Exception:
-        pass
+    except Exception as exc:
+        log.debug("failed to save debug screenshot: %s", exc)
     return False
 
 
@@ -138,8 +147,8 @@ def submit_post(page):
             else:
                 page.locator("div[role='dialog']").first.click(position={"x": 10, "y": 10})
             human_pause(0.3, 0.6)
-    except Exception:
-        pass
+    except Exception as exc:
+        log.debug("autocomplete dismissal failed: %s", exc)
 
     def _click_first_visible(selectors):
         for selector in selectors:
@@ -148,7 +157,8 @@ def submit_post(page):
                 if el.is_visible():
                     el.click()
                     return True
-            except Exception:
+            except Exception as exc:
+                log.debug("submit selector %r failed: %s", selector, exc)
                 continue
         for name in [r"^Next$", r"^Post$"]:
             try:
@@ -158,7 +168,8 @@ def submit_post(page):
                 if btn.is_visible():
                     btn.click()
                     return True
-            except Exception:
+            except Exception as exc:
+                log.debug("submit button role-name %r failed: %s", name, exc)
                 continue
         return False
 
@@ -194,8 +205,8 @@ def submit_post(page):
                 print("Clicking final Post button...")
                 el.click()
                 break
-    except Exception:
-        pass
+    except Exception as exc:
+        log.debug("final Post/Publish click failed: %s", exc)
 
     return True
 
@@ -214,7 +225,8 @@ def attach_image(page, image_path: Path) -> bool:
             print(f"Image attached: {image_path.name}")
             human_pause(3.0, 5.0)
             return True
-        except Exception:
+        except Exception as exc:
+            log.debug("file-chooser attach failed: %s", exc)
             return False
 
     # Phase 1: wait up to 8s for the Add-to-post toolbar to appear, then click the icon
@@ -223,8 +235,8 @@ def attach_image(page, image_path: Path) -> bool:
             "div[role='dialog'] [aria-label='Photo/video'], div[role='dialog'] [aria-label*='Photo'], [aria-label='Photo/video']",
             timeout=8000,
         )
-    except Exception:
-        pass
+    except Exception as exc:
+        log.debug("photo toolbar wait failed: %s", exc)
     human_pause(0.5, 1.0)
     for selector in [
         "div[role='dialog'] [aria-label='Photo/video']",
@@ -240,7 +252,8 @@ def attach_image(page, image_path: Path) -> bool:
             # Clicking opened the "Add to your post" panel — proceed to Phase 2
             human_pause(0.5, 1.0)
             break
-        except Exception:
+        except Exception as exc:
+            log.debug("photo button selector %r failed: %s", selector, exc)
             continue
 
     # Phase 2: "Add to your post" panel is open — click Photo/video inside it
@@ -255,7 +268,8 @@ def attach_image(page, image_path: Path) -> bool:
             if el.is_visible():
                 if _via_chooser(el):
                     return True
-        except Exception:
+        except Exception as exc:
+            log.debug("Add-to-post panel selector %r failed: %s", selector, exc)
             continue
 
     # Phase 3: direct file input fallback
@@ -269,11 +283,78 @@ def attach_image(page, image_path: Path) -> bool:
             print(f"Image attached: {image_path.name}")
             human_pause(3.0, 5.0)
             return True
-        except Exception:
+        except Exception as exc:
+            log.debug("file input selector %r failed: %s", selector, exc)
             continue
 
     print("Could not attach image — photo button not found.")
     return False
+
+
+POST_ID_PATTERN = re.compile(r"(?:story_fbid=|fbid=|/posts/|/permalink/)([\w.-]+)")
+
+
+def capture_published_post(page) -> dict | None:
+    """
+    Best-effort: read the newest post's permalink out of the page feed right
+    after publishing and pull an ID out of it, so boost.py doesn't have to
+    guess "the most recent post" from Ads Manager's table sort order alone.
+
+    Facebook post links carry either a legacy numeric story_fbid or (on
+    newer rollouts) an opaque pfbid token, depending on the account -- this
+    returns whichever is present. boost.py only trusts the numeric form for
+    an exact match against the Ads Manager "Select post" table (that table
+    only ever shows plain numeric IDs) and falls back loudly, with a
+    warning, when it can't verify one. This is deliberately best-effort: it
+    narrows the failure mode from "silently boosts the wrong post" to
+    "tells you it isn't sure," not a guaranteed exact match.
+    """
+    try:
+        page.evaluate("window.scrollTo({top: 0, behavior: 'instant'})")
+    except Exception as exc:
+        log.debug("scroll-to-top before post-ID capture failed: %s", exc)
+    human_pause(1.5, 2.5)
+
+    for selector in [
+        "div[role='article'] a[href*='/posts/']",
+        "div[role='article'] a[href*='story_fbid']",
+        "div[role='article'] a[href*='/permalink/']",
+        "a[href*='/posts/'][aria-label]",
+        "a[href*='story_fbid'][aria-label]",
+    ]:
+        try:
+            links = page.locator(selector).all()
+        except Exception as exc:
+            log.debug("post-ID capture selector %r failed: %s", selector, exc)
+            continue
+        for link in links[:3]:
+            try:
+                href = link.get_attribute("href") or ""
+            except Exception as exc:
+                log.debug("could not read href during post-ID capture: %s", exc)
+                continue
+            match = POST_ID_PATTERN.search(href)
+            if match:
+                return {"post_id": match.group(1), "url": href}
+    return None
+
+
+def save_last_post(account_name: str, post_info: dict | None) -> None:
+    """Record what post.py just published so boost.py can verify it's
+    boosting the right post instead of inferring "most recent" blind."""
+    data = {}
+    if LAST_POST_PATH.exists():
+        try:
+            data = json.loads(LAST_POST_PATH.read_text())
+        except Exception as exc:
+            log.debug("could not read existing last_post.json, overwriting: %s", exc)
+            data = {}
+    data[account_name] = {
+        "post_id": post_info.get("post_id") if post_info else None,
+        "url": post_info.get("url") if post_info else None,
+        "published_at": datetime.now(timezone.utc).isoformat(),
+    }
+    LAST_POST_PATH.write_text(json.dumps(data, indent=2))
 
 
 def publish_post(page, post, index, page_url="https://www.facebook.com/", image_path=None, navigate=True):
@@ -288,8 +369,8 @@ def publish_post(page, post, index, page_url="https://www.facebook.com/", image_
         human_pause(2.0, 3.0)
         try:
             page.evaluate("window.scrollTo({top: 0, behavior: 'instant'})")
-        except Exception:
-            pass
+        except Exception as exc:
+            log.debug("scroll-to-top failed: %s", exc)
         human_pause(1.0, 1.5)
 
     print("Opening composer...")
@@ -302,8 +383,8 @@ def publish_post(page, post, index, page_url="https://www.facebook.com/", image_
         textbox = page.locator("div[role='dialog'] div[role='textbox'][contenteditable='true']").first
         textbox.click()
         human_pause(0.5, 1.0)
-    except Exception:
-        pass
+    except Exception as exc:
+        log.debug("composer textbox click failed: %s", exc)
 
     human_type(page, post["text"])
 
@@ -312,8 +393,8 @@ def publish_post(page, post, index, page_url="https://www.facebook.com/", image_
     try:
         page.keyboard.press("Escape")
         human_pause(0.4, 0.7)
-    except Exception:
-        pass
+    except Exception as exc:
+        log.debug("autocomplete-dismiss Escape failed: %s", exc)
 
     if image_path and image_path.exists():
         attach_image(page, image_path)
@@ -378,7 +459,8 @@ def run(account_name, posts_path, min_delay=DEFAULT_MIN_DELAY, max_delay=DEFAULT
             # Check if already in page context by looking at the composer placeholder
             try:
                 main_text = page.locator("div[role='main']").first.text_content(timeout=8000) or ""
-            except Exception:
+            except Exception as exc:
+                log.debug("could not read main content for page-context check: %s", exc)
                 main_text = ""
             already_on_page = any(
                 re.search(rf'\b{s}\b', page.url, re.I) or
@@ -402,8 +484,8 @@ def run(account_name, posts_path, min_delay=DEFAULT_MIN_DELAY, max_delay=DEFAULT
                             human_pause(2.0, 3.0)
                             switched = True
                             break
-                except Exception:
-                    pass
+                except Exception as exc:
+                    log.debug("sidebar page-link scan failed: %s", exc)
 
                 # Fallback: Switch Now button
                 if not switched:
@@ -420,8 +502,8 @@ def run(account_name, posts_path, min_delay=DEFAULT_MIN_DELAY, max_delay=DEFAULT
                                 human_pause(2.0, 3.0)
                                 switched = True
                                 break
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        log.debug("Switch Now fallback failed: %s", exc)
 
                 if not switched:
                     print("Could not find page in sidebar or Switch Now — continuing with current URL.")
@@ -443,11 +525,21 @@ def run(account_name, posts_path, min_delay=DEFAULT_MIN_DELAY, max_delay=DEFAULT
                     time.sleep(delay)
 
             print("\nAll posts done.")
+            post_info = capture_published_post(page)
+            save_last_post(account_name, post_info)
+            if post_info and post_info.get("post_id"):
+                print(f"Recorded published post for boost.py: {post_info['post_id']}")
+            else:
+                print(
+                    "Could not capture the published post's ID — boost.py will fall back "
+                    "to inferring the most recent post and will warn you to verify it."
+                )
+
             print("Browser is open. Close it when done.")
             try:
                 page.wait_for_event("close", timeout=0)
-            except Exception:
-                pass
+            except Exception as exc:
+                log.debug("wait_for_event(close) ended: %s", exc)
         finally:
             pass  # Leave profile running so next run reconnects to the live session
 

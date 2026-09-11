@@ -8,13 +8,20 @@ from __future__ import annotations
 
 import asyncio
 import getpass
+import json
+import logging
 import os
 import re
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+log = logging.getLogger(__name__)
 
 ROOT = Path(__file__).parent
 ENV_FILE = ROOT / ".env"
+LAST_POST_PATH = ROOT / "last_post.json"
+POST_MATCH_STALENESS = timedelta(minutes=30)
 
 
 # ── Credentials ───────────────────────────────────────────────────────────────
@@ -81,6 +88,41 @@ def pick_account() -> str:
         print("  Please enter a number from the list.")
 
 
+# ── Last-published-post lookup ────────────────────────────────────────────────
+
+def _load_last_post(account: str) -> dict | None:
+    """
+    Read what post.py recorded as the most recently published post for this
+    account (see post.save_last_post). Returns None if there's no record, the
+    file is unreadable, or the record is older than POST_MATCH_STALENESS --
+    in all those cases the caller falls back to inferring "most recent" from
+    the Ads Manager table, same as before, but now it says so out loud.
+    """
+    if not LAST_POST_PATH.exists():
+        return None
+    try:
+        data = json.loads(LAST_POST_PATH.read_text())
+    except Exception as exc:
+        log.debug("could not read last_post.json: %s", exc)
+        return None
+
+    record = data.get(account)
+    if not record:
+        return None
+
+    published_at = record.get("published_at")
+    if published_at:
+        try:
+            when = datetime.fromisoformat(published_at)
+            if datetime.now(timezone.utc) - when > POST_MATCH_STALENESS:
+                print(f"  NOTE: recorded post for {account} is stale ({published_at}) — ignoring.")
+                return None
+        except Exception as exc:
+            log.debug("could not parse published_at %r: %s", published_at, exc)
+
+    return record
+
+
 # ── TextVerified SMS ──────────────────────────────────────────────────────────
 
 def _get_sms_code(verification) -> str | None:
@@ -131,7 +173,8 @@ async def _handle_verification(page) -> bool:
             try:
                 await page.click(f'button:has-text("{label}")', timeout=3000)
                 break
-            except Exception:
+            except Exception as exc:
+                log.debug("phone-submit button %r failed: %s", label, exc)
                 continue
 
         await page.wait_for_timeout(2000)
@@ -151,7 +194,8 @@ async def _handle_verification(page) -> bool:
                 try:
                     await page.click(f'button:has-text("{label}")', timeout=3000)
                     break
-                except Exception:
+                except Exception as exc:
+                    log.debug("code-submit button %r failed: %s", label, exc)
                     continue
             await page.wait_for_load_state("networkidle")
             tv.verifications.cancel(verification.id)
@@ -170,7 +214,7 @@ async def _handle_verification(page) -> bool:
 
 # ── Main ad creation flow ─────────────────────────────────────────────────────
 
-async def boost(cdp_url: str):
+async def boost(cdp_url: str, account: str):
     from playwright.async_api import async_playwright
 
     async with async_playwright() as p:
@@ -190,8 +234,8 @@ async def boost(cdp_url: str):
         await page.wait_for_load_state("domcontentloaded", timeout=30000)
         try:
             await page.wait_for_selector("text=Campaigns", timeout=30000)
-        except Exception:
-            pass
+        except Exception as exc:
+            log.debug("Campaigns header wait failed: %s", exc)
         await page.wait_for_timeout(2000)
 
         # ── Create campaign ───────────────────────────────────────
@@ -209,7 +253,8 @@ async def boost(cdp_url: str):
                 await page.click(selector, timeout=4000)
                 clicked = True
                 break
-            except Exception:
+            except Exception as exc:
+                log.debug("create-campaign selector %r failed: %s", selector, exc)
                 continue
 
         if not clicked:
@@ -220,8 +265,8 @@ async def boost(cdp_url: str):
                 ).first
                 await btn.click(timeout=8000)
                 clicked = True
-            except Exception:
-                pass
+            except Exception as exc:
+                log.debug("fallback Create button match failed: %s", exc)
 
         if not clicked:
             raise RuntimeError("Could not find the + Create campaign button in Ads Manager.")
@@ -232,8 +277,8 @@ async def boost(cdp_url: str):
         # click below can land before the dialog content exists.
         try:
             await page.wait_for_selector("text=Loading creation", state="hidden", timeout=20000)
-        except Exception:
-            pass
+        except Exception as exc:
+            log.debug("Loading-creation spinner wait failed: %s", exc)
 
         # Current Ads Manager UI: modal shows objective radio buttons directly.
         # No "Manual campaign" step — just select Engagement and Continue.
@@ -259,8 +304,8 @@ async def boost(cdp_url: str):
             )
             await manual_continue.click(timeout=8000)
             await page.wait_for_timeout(1200)
-        except Exception:
-            pass  # some accounts may skip straight past this dialog
+        except Exception as exc:
+            log.debug("Manual-setup dialog step skipped: %s", exc)  # some accounts may skip straight past this dialog
 
         # Single-page campaign editor (Campaign name / details / Budget) —
         # click Next to move to the Ad set section. Not a real <button>.
@@ -284,8 +329,8 @@ async def boost(cdp_url: str):
             await page.wait_for_timeout(600)
             await page.click("text=Post engagement", timeout=5000)
             await page.wait_for_timeout(800)
-        except Exception:
-            pass  # already set, or account defaults differently
+        except Exception as exc:
+            log.debug("Engagement-type dropdown skipped: %s", exc)  # already set, or account defaults differently
 
         # Location targeting lives inside "Audience controls", not rendered
         # until scrolled near — some accounts' Ad Set page isn't virtualized
@@ -347,8 +392,8 @@ async def boost(cdp_url: str):
                 await included.click(timeout=5000)
                 await page.wait_for_timeout(800)
                 best = await nearest_below('text="Edit"')
-            except Exception:
-                pass
+            except Exception as exc:
+                log.debug("Locations 'Edit' link activation-click failed: %s", exc)
         if best is None:
             raise RuntimeError("Could not find the Locations 'Edit' link.")
         await best.click(timeout=8000)
@@ -366,7 +411,8 @@ async def boost(cdp_url: str):
                 if await cand.is_visible(timeout=2000):
                     search = cand
                     break
-            except Exception:
+            except Exception as exc:
+                log.debug("location search input %r failed: %s", sel, exc)
                 continue
         if not search:
             raise RuntimeError("No location search input found after clicking Edit.")
@@ -400,18 +446,61 @@ async def boost(cdp_url: str):
                 handle,
             )
             await page.wait_for_timeout(500)
-        except Exception:
-            pass
+        except Exception as exc:
+            log.debug("Ad setup heading scroll failed: %s", exc)
         await page.click("text=Use existing post")
         await page.wait_for_timeout(1000)
         await page.click("text=Select post")
         await page.wait_for_timeout(2000)
 
         # "Select post" is a table (Facebook post / Post ID / Source / Media
-        # / Date created), sorted newest first — not a media grid. The first
-        # numeric Post ID cell is the most recent post.
-        first_post_id = page.locator("text=/^\\d{15,}$/").first
-        await first_post_id.click(timeout=15000)
+        # / Date created), sorted newest first — not a media grid. Rather than
+        # blindly trusting the first row (a race against anything else that
+        # posts between post.py finishing and this running), try to match the
+        # post ID post.py actually recorded, and fall back loudly if we can't.
+        last_post = _load_last_post(account)
+        target_post_id = last_post.get("post_id") if last_post else None
+        # The table only ever shows the legacy numeric ID scheme -- an opaque
+        # pfbid token (which post.py may have captured instead) can't be
+        # matched here, so don't pretend a non-numeric ID is verifiable.
+        if target_post_id and not re.fullmatch(r"\d{15,}", target_post_id):
+            print(
+                f"  NOTE: recorded post ID {target_post_id!r} isn't the numeric "
+                f"scheme this table uses — can't verify it here."
+            )
+            target_post_id = None
+
+        candidate_rows = page.locator("text=/^\\d{15,}$/")
+        chosen = None
+        if target_post_id:
+            exact = candidate_rows.filter(has_text=re.compile(rf"^{re.escape(target_post_id)}$"))
+            if await exact.count() > 0:
+                chosen = exact.first
+                print(f"  Matched recorded post ID {target_post_id} exactly.")
+            else:
+                print(
+                    f"  WARNING: post.py recorded post ID {target_post_id} but it doesn't "
+                    f"appear in this table (ID scheme mismatch, or the post isn't indexed "
+                    f"here yet). Falling back to the newest row — verify this is the right "
+                    f"post before confirming Publish."
+                )
+        elif last_post is not None:
+            print(
+                f"  WARNING: post.py's recorded post has no usable numeric ID "
+                f"(published_at={last_post.get('published_at')}). Falling back to the "
+                f"newest row in this table — verify it matches before confirming Publish."
+            )
+        else:
+            print(
+                "  WARNING: no record from post.py for this account (missing or stale) — "
+                "cannot verify which post this is. Falling back to the newest row in this "
+                "table — verify it matches before confirming Publish."
+            )
+
+        if chosen is None:
+            chosen = candidate_rows.first
+
+        await chosen.click(timeout=15000)
         await page.wait_for_timeout(1000)
 
         continue_post_btn = page.get_by_role("button", name=re.compile(r"^Continue$", re.I))
@@ -431,8 +520,8 @@ async def boost(cdp_url: str):
                 if el:
                     needs_verification = True
                     break
-            except Exception:
-                pass
+            except Exception as exc:
+                log.debug("verification-prompt check for %r failed: %s", text, exc)
 
         if needs_verification:
             print("\nSMS verification required...")
@@ -457,7 +546,7 @@ def main():
     client, started = start_profile_for(account)
 
     try:
-        asyncio.run(boost(started.cdp_url))
+        asyncio.run(boost(started.cdp_url, account))
     finally:
         client.stop_profile(started.profile_id)
 
