@@ -2,6 +2,10 @@
 boost.py  —  Phase 2
 Creates a Facebook engagement ad campaign for the most recent post on a page.
 Run this after post.py has published posts.
+
+Prompts at the end to either publish the campaign immediately or leave it
+as a draft in Ads Manager for manual review -- defaults to draft, since
+publishing spends real ad budget.
 """
 
 from __future__ import annotations
@@ -38,30 +42,8 @@ def _load_dotenv():
             os.environ[key.strip()] = value.strip()
 
 
-def ensure_credentials():
-    _load_dotenv()
-
-    keys = ["MLX_EMAIL", "MLX_PASSWORD", "TEXTVERIFIED_API_KEY", "TEXTVERIFIED_USERNAME"]
-    values = {k: os.environ.get(k, "").strip() for k in keys}
-
-    if all(values.values()):
-        return
-
-    print("\n── Credentials ───────────────────────────────────────────")
-    print("(Saved to .env so you only need to enter them once.)\n")
-
-    if not values["MLX_EMAIL"]:
-        values["MLX_EMAIL"] = input("  Multilogin email: ").strip()
-    if not values["MLX_PASSWORD"]:
-        values["MLX_PASSWORD"] = getpass.getpass("  Multilogin password: ").strip()
-    if not values["TEXTVERIFIED_API_KEY"]:
-        values["TEXTVERIFIED_API_KEY"] = input("  TextVerified API key: ").strip()
-    if not values["TEXTVERIFIED_USERNAME"]:
-        values["TEXTVERIFIED_USERNAME"] = input("  TextVerified username (email): ").strip()
-
-    for k, v in values.items():
-        os.environ[k] = v
-
+def _save_env(values: dict[str, str]) -> None:
+    keys = list(values.keys())
     existing = []
     if ENV_FILE.exists():
         existing = [l for l in ENV_FILE.read_text().splitlines()
@@ -69,6 +51,49 @@ def ensure_credentials():
     lines = existing + [f"{k}={v}" for k, v in values.items()]
     ENV_FILE.write_text("\n".join(lines) + "\n")
     print("  Saved to .env")
+
+
+def ensure_mlx_credentials():
+    """Required for every run -- starting a Multilogin profile needs these
+    regardless of whether the campaign ends up published or left as a draft."""
+    _load_dotenv()
+
+    values = {k: os.environ.get(k, "").strip() for k in ["MLX_EMAIL", "MLX_PASSWORD"]}
+    if all(values.values()):
+        return
+
+    print("\n── Multilogin credentials ────────────────────────────────")
+    print("(Saved to .env so you only need to enter them once.)\n")
+
+    if not values["MLX_EMAIL"]:
+        values["MLX_EMAIL"] = input("  Multilogin email: ").strip()
+    if not values["MLX_PASSWORD"]:
+        values["MLX_PASSWORD"] = getpass.getpass("  Multilogin password: ").strip()
+
+    for k, v in values.items():
+        os.environ[k] = v
+    _save_env(values)
+
+
+def ensure_textverified_credentials():
+    """Only needed if we're actually going to click Publish -- SMS
+    verification can't trigger on a campaign left as a draft, so a
+    draft-only run should never have to provide these."""
+    values = {k: os.environ.get(k, "").strip() for k in ["TEXTVERIFIED_API_KEY", "TEXTVERIFIED_USERNAME"]}
+    if all(values.values()):
+        return
+
+    print("\n── TextVerified credentials ──────────────────────────────")
+    print("(Needed for SMS verification when actually publishing. Saved to .env.)\n")
+
+    if not values["TEXTVERIFIED_API_KEY"]:
+        values["TEXTVERIFIED_API_KEY"] = input("  TextVerified API key: ").strip()
+    if not values["TEXTVERIFIED_USERNAME"]:
+        values["TEXTVERIFIED_USERNAME"] = input("  TextVerified username (email): ").strip()
+
+    for k, v in values.items():
+        os.environ[k] = v
+    _save_env(values)
 
 
 # ── Account picker ────────────────────────────────────────────────────────────
@@ -86,6 +111,19 @@ def pick_account() -> str:
         if choice.isdigit() and 1 <= int(choice) <= len(accounts):
             return accounts[int(choice) - 1]
         print("  Please enter a number from the list.")
+
+
+def ask_publish_mode() -> bool:
+    """Defaults to draft: this spends real ad money once published, and
+    Facebook auto-saves an in-progress campaign as a draft in Ads Manager
+    when you navigate away without clicking Publish, so "draft" is the safe
+    default and an explicit opt-in is required to actually publish."""
+    print("\n── Publish mode ──────────────────────────────────────────")
+    choice = input(
+        "  Publish this campaign now, or leave it as a draft to review? "
+        "[draft/publish] (default: draft): "
+    ).strip().lower()
+    return choice in ("publish", "p", "yes", "y")
 
 
 # ── Last-published-post lookup ────────────────────────────────────────────────
@@ -280,7 +318,7 @@ async def select_target_post(page, account: str) -> str | None:
 
 # ── Main ad creation flow ─────────────────────────────────────────────────────
 
-async def boost(cdp_url: str, account: str):
+async def boost(cdp_url: str, account: str, publish: bool = False):
     from playwright.async_api import async_playwright
 
     async with async_playwright() as p:
@@ -530,7 +568,15 @@ async def boost(cdp_url: str, account: str):
         await continue_post_btn.click(timeout=8000)
         await page.wait_for_load_state("networkidle")
 
-        # ── Publish ───────────────────────────────────────────────
+        # ── Publish (or leave as a draft) ───────────────────────────
+        if not publish:
+            print(
+                "\nLeaving campaign as a draft — not clicking Publish. Facebook "
+                "auto-saves it under Ads Manager > Drafts; review and publish it "
+                "there manually when ready."
+            )
+            return
+
         print("Publishing campaign...")
         await page.click('button:has-text("Publish")')
         await page.wait_for_timeout(3000)
@@ -561,15 +607,18 @@ def main():
     print("   Facebook Ad Booster")
     print("=" * 54)
 
-    ensure_credentials()
+    ensure_mlx_credentials()
     account = pick_account()
+    publish = ask_publish_mode()
+    if publish:
+        ensure_textverified_credentials()
 
     print(f"\nStarting profile '{account}'...")
     from mlx_context import start_profile_for
     client, started = start_profile_for(account)
 
     try:
-        asyncio.run(boost(started.cdp_url, account))
+        asyncio.run(boost(started.cdp_url, account, publish=publish))
     finally:
         client.stop_profile(started.profile_id)
 
