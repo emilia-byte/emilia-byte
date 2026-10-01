@@ -371,6 +371,52 @@ async def _dismiss_auth_prompt(page) -> bool:
 
 # ── Main ad creation flow ─────────────────────────────────────────────────────
 
+CREATE_BUTTON_SELECTORS = [
+    # data-surface is the most reliable match: DevTools inspection showed the
+    # button's accessible name is empty on some accounts (Facebook renders
+    # "Create" via child markup, not real accessible text), so role/name and
+    # plain text matching can't find it -- but this internal surface
+    # identifier is stable.
+    '[data-surface="/am/table/tool_bar/lib:creation-button"]',
+    '[data-testid="create-entity-button"]',
+    'a[href*="create"]:has-text("Create"):not(:has-text("view"))',
+    'div[aria-label="Create campaign"]',
+]
+
+
+async def click_create_button(page, timeout: int = 4000) -> str | None:
+    """
+    Click Ads Manager's green "+ Create" button -- not "Create a view" or
+    other Create-ish controls. Returns a label for the strategy that worked
+    (for logging and the DOM-fixture tests), or None if nothing matched.
+    """
+    for selector in CREATE_BUTTON_SELECTORS:
+        try:
+            await page.click(selector, timeout=timeout)
+            return selector
+        except Exception as exc:
+            log.debug("create-campaign selector %r failed: %s", selector, exc)
+
+    # Accessible-name match: the "+" is an aria-hidden icon glyph, so the
+    # computed name is just "Create" -- sturdier than raw textContent, which
+    # can pick up whitespace/icon text depending on the DOM structure.
+    try:
+        await page.get_by_role("button", name=re.compile(r"^\+?\s*Create$", re.I)).first.click(timeout=timeout * 2)
+        return "role=button[name=Create]"
+    except Exception as exc:
+        log.debug("accessible-name Create button match failed: %s", exc)
+
+    # Last resort: the link/button whose full text is exactly "Create" or "+ Create"
+    try:
+        await page.locator('a, button, div[role="button"]').filter(
+            has_text=re.compile(r'^\+?\s*Create$', re.I)
+        ).first.click(timeout=timeout * 2)
+        return "text=Create"
+    except Exception as exc:
+        log.debug("fallback Create button match failed: %s", exc)
+    return None
+
+
 async def boost(cdp_url: str, account: str, publish: bool = False):
     from playwright.async_api import async_playwright
 
@@ -424,35 +470,13 @@ async def boost(cdp_url: str, account: str, publish: bool = False):
         print("Creating campaign...")
         await page.wait_for_timeout(2000)
 
-        # Target the green "+ Create" button precisely — avoid "Create a view" etc.
-        clicked = False
-        for selector in [
-            '[data-testid="create-entity-button"]',
-            'a[href*="create"]:has-text("Create"):not(:has-text("view"))',
-            'div[aria-label="Create campaign"]',
-        ]:
+        if await click_create_button(page) is None:
             try:
-                await page.click(selector, timeout=4000)
-                clicked = True
-                break
+                await page.screenshot(path=str(ROOT / "debug_create.png"))
+                print("Create button not found. Screenshot saved to debug_create.png")
             except Exception as exc:
-                log.debug("create-campaign selector %r failed: %s", selector, exc)
-                continue
-
-        if not clicked:
-            # Last resort: find the link/button whose full text is exactly "Create" or "+ Create"
-            try:
-                btn = page.locator('a, button, div[role="button"]').filter(
-                    has_text=re.compile(r'^\+?\s*Create$', re.I)
-                ).first
-                await btn.click(timeout=8000)
-                clicked = True
-            except Exception as exc:
-                log.debug("fallback Create button match failed: %s", exc)
-
-        if not clicked:
-            await page.screenshot(path=str(ROOT / "debug_create.png"))
-            raise RuntimeError("Could not find the + Create campaign button in Ads Manager. Screenshot saved to debug_create.png")
+                log.debug("failed to save debug screenshot: %s", exc)
+            raise RuntimeError("Could not find the + Create campaign button in Ads Manager.")
         await page.wait_for_timeout(1500)
 
         # Wait for "Loading creation" spinner to fully disappear before interacting.

@@ -1,0 +1,13 @@
+<!DOCTYPE html>
+<!-- Ads Manager campaigns toolbar with no data-surface/data-testid hooks:
+     the "+ Create" button is a real button whose "+" is an aria-hidden icon,
+     so its accessible name is just "Create". A decoy "Create a view" button
+     sits first in the DOM. -->
+<html>
+<body>
+  <div role="toolbar">
+    <button onclick="window.__clicked='view'">Create a view</button>
+    <button onclick="window.__clicked='create'"><span aria-hidden="true">+</span> Create</button>
+  </div>
+</body>
+</html>

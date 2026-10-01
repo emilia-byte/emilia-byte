@@ -1,0 +1,17 @@
+<!DOCTYPE html>
+<!-- Ads Manager campaigns toolbar where the "+ Create" button has NO
+     accessible name (label rendered via aria-hidden child markup) and is only
+     identifiable by its data-surface attribute. A decoy "Create a view"
+     button sits first in the DOM. -->
+<html>
+<body>
+  <div role="toolbar">
+    <div role="button" tabindex="0" onclick="window.__clicked='view'">Create a view</div>
+    <div role="button" tabindex="0"
+         data-surface="/am/table/tool_bar/lib:creation-button"
+         onclick="window.__clicked='create'">
+      <span aria-hidden="true">+</span><span aria-hidden="true">Create</span>
+    </div>
+  </div>
+</body>
+</html>

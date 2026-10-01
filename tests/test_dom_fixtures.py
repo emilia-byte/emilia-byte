@@ -159,3 +159,36 @@ def test_select_target_post_falls_back_on_stale_record(tmp_path, monkeypatch, ca
     out = capsys.readouterr().out
     assert "stale" in out
     assert "WARNING" in out
+
+
+# ── boost.click_create_button ─────────────────────────────────────────────
+
+def _run_click_create(fixture: str) -> tuple[str | None, str | None]:
+    """Run click_create_button() against a fixture toolbar and return
+    (strategy_used, which_element_was_clicked)."""
+
+    async def scenario():
+        async with async_playwright() as p:
+            browser = await p.chromium.launch()
+            page = await browser.new_page()
+            await page.goto(_uri(fixture))
+            strategy = await boost.click_create_button(page, timeout=1000)
+            clicked = await page.evaluate("() => window.__clicked || null")
+            await browser.close()
+            return strategy, clicked
+
+    return asyncio.run(scenario())
+
+
+def test_click_create_button_uses_data_surface_when_no_accessible_name():
+    strategy, clicked = _run_click_create("create_button_data_surface.html")
+
+    assert strategy == boost.CREATE_BUTTON_SELECTORS[0]
+    assert clicked == "create"  # not the "Create a view" decoy
+
+
+def test_click_create_button_falls_back_to_accessible_name():
+    strategy, clicked = _run_click_create("create_button_role_only.html")
+
+    assert strategy == "role=button[name=Create]"
+    assert clicked == "create"  # not the "Create a view" decoy
