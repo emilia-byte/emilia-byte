@@ -100,12 +100,13 @@ def pick_mode() -> str:
     print("  2. Generate posts only       (one profile)")
     print("  3. Publish existing posts.txt (one profile)")
     print("  4. Batch: generate unique posts per profile + publish all")
+    print("  5. Batch: boost the latest post on several profiles")
 
     while True:
-        choice = input("\n  Pick [1-4]: ").strip()
-        if choice in ("1", "2", "3", "4"):
+        choice = input("\n  Pick [1-5]: ").strip()
+        if choice in ("1", "2", "3", "4", "5"):
             return choice
-        print("  Please enter 1, 2, 3, or 4.")
+        print("  Please enter 1, 2, 3, 4, or 5.")
 
 
 # ── Category picker (optional override) ──────────────────────────────────────
@@ -154,14 +155,13 @@ def generate(account: str, category: str | None) -> bool:
     return run_cmd(cmd)
 
 
-def batch_generate_and_publish(category: str | None) -> bool:
-    import json
+def _pick_batch_profiles() -> list[str]:
     from mlx_context import list_accounts
 
     profiles = list_accounts()
     if not profiles:
         print("No profiles found in mlx_profiles.json.")
-        return False
+        return []
 
     # ── Profile selection ──────────────────────────────────────────────────
     print(f"\n── Batch mode: profile selection ─────────────────────────")
@@ -191,8 +191,20 @@ def batch_generate_and_publish(category: str | None) -> bool:
             selected = names
             break
 
-    profiles = selected
-    print(f"\n  Running on {len(profiles)} profile(s): {', '.join(profiles)}")
+    print(f"\n  Running on {len(selected)} profile(s): {', '.join(selected)}")
+    return selected
+
+
+def _pick_workers(n_profiles: int) -> int:
+    default = min(n_profiles, 5)
+    workers = input(f"\n  How many to run simultaneously? [default: {default}]: ").strip()
+    return int(workers) if workers.isdigit() and int(workers) > 0 else default
+
+
+def batch_generate_and_publish(category: str | None) -> bool:
+    profiles = _pick_batch_profiles()
+    if not profiles:
+        return False
 
     if not category:
         CATEGORIES = {"1": "LS", "2": "HOB", "3": "CSI", "4": "MF"}
@@ -208,8 +220,7 @@ def batch_generate_and_publish(category: str | None) -> bool:
                 break
             print("  Please enter 1, 2, 3, or 4.")
 
-    workers = input(f"\n  How many to run simultaneously? [default: {min(len(profiles), 5)}]: ").strip()
-    workers = int(workers) if workers.isdigit() and int(workers) > 0 else min(len(profiles), 5)
+    workers = _pick_workers(len(profiles))
 
     print("\n" + "─" * 54)
     print(f"Generating unique posts for {len(profiles)} profiles...")
@@ -242,6 +253,24 @@ def batch_generate_and_publish(category: str | None) -> bool:
                     "--workers", str(workers)])
 
 
+def batch_boost() -> bool:
+    profiles = _pick_batch_profiles()
+    if not profiles:
+        return False
+    workers = _pick_workers(len(profiles))
+
+    print("\n── Boost mode ────────────────────────────────────────────")
+    choice = input("  Leave campaigns as drafts, or publish? [draft/publish] (default: draft): ").strip().lower()
+    # boost_batch.py still asks for a typed confirmation before publishing.
+    publish_flag = ["--publish"] if choice == "publish" else []
+
+    print("\n" + "─" * 54)
+    print(f"Batch boosting {len(profiles)} profiles ({workers} at a time)...")
+    print("─" * 54)
+    return run_cmd(["boost_batch.py", "--profiles", ",".join(profiles),
+                    "--workers", str(workers)] + publish_flag)
+
+
 def publish(account: str) -> bool:
     if not POSTS_FILE.exists():
         print(f"\nError: {POSTS_FILE} not found. Run 'Generate posts' first.")
@@ -267,6 +296,8 @@ def main():
     if mode == "4":
         category = pick_category()
         ok = batch_generate_and_publish(category)
+    elif mode == "5":
+        ok = batch_boost()
     else:
         account = pick_account()
         if mode == "1":

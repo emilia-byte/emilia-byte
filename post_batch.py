@@ -19,6 +19,8 @@ import random
 import sys
 from pathlib import Path
 
+from console import profile_tag
+
 ROOT = Path(__file__).parent
 ENV_FILE = ROOT / ".env"
 
@@ -44,6 +46,9 @@ async def run_profile(
     results: dict,
 ):
     tag = f"[{profile_name}]"
+    # Everything post.py/boost.py prints from this task (and the threads it
+    # starts) gets this profile's tag -- see console.py.
+    profile_tag.set(tag)
 
     async with semaphore:
         jitter = random.uniform(5, 20)
@@ -110,6 +115,11 @@ def main():
     parser.add_argument("--max-delay", type=int, default=90,
                         help="Max seconds between posts (default: 90)")
     args = parser.parse_args()
+
+    # Ask for any missing credentials now, before profiles start in parallel,
+    # never halfway through a batch.
+    from boost import ensure_mlx_credentials
+    ensure_mlx_credentials()
 
     if args.profiles:
         profiles = [p.strip() for p in args.profiles.split(",")]

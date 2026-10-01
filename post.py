@@ -33,6 +33,10 @@ from mlx_context import start_profile_for
 from fb_dom import js_navigate
 from state_file import read_json, update_json
 
+# Batch runs post from several profiles at once (one thread each): tag every
+# line with the profile it's about (see console.py).
+from console import profile_tag, tagged_print as print
+
 log = logging.getLogger(__name__)
 
 PAGE_URLS_PATH = Path(__file__).parent / "page_urls.json"
@@ -186,8 +190,11 @@ def open_composer(page):
             continue
 
     try:
-        page.screenshot(path=os.path.join(os.path.dirname(__file__), "debug_composer.png"))
-        print("Composer not found. Screenshot saved to debug_composer.png")
+        # Per-profile name so concurrent batch profiles don't overwrite each other's.
+        suffix = re.sub(r"[^A-Za-z0-9_-]", "", profile_tag.get())
+        filename = f"debug_composer_{suffix}.png" if suffix else "debug_composer.png"
+        page.screenshot(path=os.path.join(os.path.dirname(__file__), filename))
+        print(f"Composer not found. Screenshot saved to {filename}")
     except Exception as exc:
         log.debug("failed to save debug screenshot: %s", exc)
     return False

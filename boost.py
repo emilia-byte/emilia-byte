@@ -20,12 +20,28 @@ import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+# Batch runs boost several profiles at once: tag every line with the profile
+# it's about, and prompt without freezing the other profiles (see console.py).
+from console import ask, tagged_print as print
+
 log = logging.getLogger(__name__)
 
 ROOT = Path(__file__).parent
 ENV_FILE = ROOT / ".env"
 LAST_POST_PATH = ROOT / "last_post.json"
 POST_MATCH_STALENESS = timedelta(minutes=30)
+
+
+async def _debug_screenshot(page, name: str, account: str) -> str:
+    """Save debug_<name>_<account>.png -- per-account so concurrent profiles
+    don't overwrite each other's evidence. Returns the file name; a failed
+    screenshot is logged, never raised, so it can't mask the real error."""
+    filename = f"debug_{name}_{re.sub(r'[^A-Za-z0-9_-]', '_', account)}.png"
+    try:
+        await page.screenshot(path=str(ROOT / filename))
+    except Exception as exc:
+        log.debug("failed to save debug screenshot %s: %s", filename, exc)
+    return filename
 
 
 # ── Credentials ───────────────────────────────────────────────────────────────
@@ -204,14 +220,22 @@ def _get_sms_code(verification) -> str | None:
     return None
 
 
+MANUAL_VERIFY_PROMPT = (
+    "  Complete verification manually in this profile's Multilogin window, "
+    "then press Enter..."
+)
+
+
 async def _handle_verification(page) -> bool:
-    """Reserve a TextVerified number, enter it in Facebook, receive and submit the code."""
+    """Reserve a TextVerified number, enter it in Facebook, receive and submit the code.
+    Everything that waits (TextVerified calls, the manual fallback prompt)
+    runs off the event loop, so in a batch the other profiles keep going."""
     try:
         from textverified import TextVerified
         from textverified.models import ReservationCapability
     except ImportError:
         print("  textverified package not installed — run setup.bat first.")
-        input("  Complete verification manually, then press Enter...")
+        await ask(MANUAL_VERIFY_PROMPT)
         return True
 
     try:
@@ -220,7 +244,8 @@ async def _handle_verification(page) -> bool:
             api_username=os.environ["TEXTVERIFIED_USERNAME"],
         )
         print("  Requesting US number from TextVerified...")
-        verification = tv.verifications.create(
+        verification = await asyncio.to_thread(
+            tv.verifications.create,
             service_name="Facebook",
             capability=ReservationCapability.SMS,
         )
@@ -266,17 +291,17 @@ async def _handle_verification(page) -> bool:
                 await page.wait_for_load_state("domcontentloaded", timeout=30000)
             except Exception as exc:
                 log.debug("_handle_verification: ignored error: %s", exc)
-            tv.verifications.cancel(verification.id)
+            await asyncio.to_thread(tv.verifications.cancel, verification.id)
             return True
         else:
             print("  Could not receive SMS code automatically.")
-            input("  Complete verification manually, then press Enter...")
-            tv.verifications.cancel(verification.id)
+            await ask(MANUAL_VERIFY_PROMPT)
+            await asyncio.to_thread(tv.verifications.cancel, verification.id)
             return True
 
     except Exception as exc:
         print(f"  Verification error: {exc}")
-        input("  Complete verification manually, then press Enter...")
+        await ask(MANUAL_VERIFY_PROMPT)
         return True
 
 
@@ -471,12 +496,8 @@ async def boost(cdp_url: str, account: str, publish: bool = False):
         await page.wait_for_timeout(2000)
 
         if await click_create_button(page) is None:
-            try:
-                await page.screenshot(path=str(ROOT / "debug_create.png"))
-                print("Create button not found. Screenshot saved to debug_create.png")
-            except Exception as exc:
-                log.debug("failed to save debug screenshot: %s", exc)
-            raise RuntimeError("Could not find the + Create campaign button in Ads Manager.")
+            shot = await _debug_screenshot(page, "create", account)
+            raise RuntimeError(f"Could not find the + Create campaign button in Ads Manager. Screenshot: {shot}")
         await page.wait_for_timeout(1500)
 
         # Wait for "Loading creation" spinner to fully disappear before interacting.
@@ -513,8 +534,8 @@ async def boost(cdp_url: str, account: str, publish: bool = False):
                     log.debug("boost: ignored error: %s", exc)
                     continue
             if not engagement_clicked:
-                await page.screenshot(path=str(ROOT / "debug_after_create.png"))
-                raise RuntimeError("Could not find Engagement objective — check debug_after_create.png")
+                shot = await _debug_screenshot(page, "after_create", account)
+                raise RuntimeError(f"Could not find Engagement objective — check {shot}")
             await page.wait_for_timeout(800)
 
             for locator in [
@@ -555,8 +576,8 @@ async def boost(cdp_url: str, account: str, publish: bool = False):
                 log.debug("boost: ignored error: %s", exc)
                 continue
         if not next_clicked:
-            await page.screenshot(path=str(ROOT / "debug_next.png"))
-            raise RuntimeError("Could not find the Next button on campaign editor. Screenshot saved to debug_next.png")
+            shot = await _debug_screenshot(page, "next", account)
+            raise RuntimeError(f"Could not find the Next button on campaign editor. Screenshot: {shot}")
         await page.wait_for_timeout(1500)
 
         # ── Ad set ────────────────────────────────────────────────
@@ -636,8 +657,8 @@ async def boost(cdp_url: str, account: str, publish: bool = False):
             except Exception as exc:
                 log.debug("Locations 'Edit' link activation-click failed: %s", exc)
         if edit_btn is None:
-            await page.screenshot(path=str(ROOT / "debug_location.png"))
-            raise RuntimeError("Could not find the Locations Edit link. Screenshot saved to debug_location.png")
+            shot = await _debug_screenshot(page, "location", account)
+            raise RuntimeError(f"Could not find the Locations Edit link. Screenshot: {shot}")
         await edit_btn.click(timeout=8000)
         await page.wait_for_timeout(1000)
 

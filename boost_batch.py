@@ -19,6 +19,8 @@ import random
 import sys
 from pathlib import Path
 
+from console import profile_tag
+
 ROOT = Path(__file__).parent
 ENV_FILE = ROOT / ".env"
 
@@ -42,6 +44,9 @@ async def run_profile(
     results: dict,
 ):
     tag = f"[{profile_name}]"
+    # Everything post.py/boost.py prints from this task (and the threads it
+    # starts) gets this profile's tag -- see console.py.
+    profile_tag.set(tag)
 
     async with semaphore:
         jitter = random.uniform(5, 20)
@@ -121,6 +126,11 @@ def main():
                         help="Publish campaigns (default: save as draft)")
     args = parser.parse_args()
 
+    # Ask for any missing credentials now, before profiles start in parallel,
+    # never halfway through a batch.
+    from boost import ensure_mlx_credentials
+    ensure_mlx_credentials()
+
     if args.profiles:
         profiles = [p.strip() for p in args.profiles.split(",")]
         unknown = [p for p in profiles if p not in all_profiles]
@@ -152,6 +162,11 @@ def main():
             print("  Not confirmed — campaigns will be saved as drafts.")
             args.publish = False
 
+    if args.publish:
+        # Publishing can trigger SMS verification; without these, every
+        # profile that hits it would stall on a manual-verification prompt.
+        from boost import ensure_textverified_credentials
+        ensure_textverified_credentials()
 
     try:
         asyncio.run(main_async(profiles, args.workers, args.publish))
