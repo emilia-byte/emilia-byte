@@ -31,6 +31,7 @@ from playwright.sync_api import sync_playwright
 
 from mlx_context import start_profile_for
 from fb_dom import js_navigate
+from state_file import read_json, update_json
 
 log = logging.getLogger(__name__)
 
@@ -38,11 +39,7 @@ PAGE_URLS_PATH = Path(__file__).parent / "page_urls.json"
 
 
 def _load_page_urls() -> dict:
-    try:
-        return json.loads(PAGE_URLS_PATH.read_text())
-    except Exception as exc:
-        log.debug("_load_page_urls: ignored error: %s", exc)
-        return {}
+    return read_json(PAGE_URLS_PATH)
 
 
 _INVALID_PAGE_SLUGS = {
@@ -76,8 +73,8 @@ def _save_page_url(account: str, url: str) -> None:
     if not _is_valid_page_url(clean):
         return
     if data.get(account) != clean:
-        data[account] = clean
-        PAGE_URLS_PATH.write_text(json.dumps(data, indent=2) + "\n")
+        # Other profiles in a batch may be saving theirs concurrently.
+        update_json(PAGE_URLS_PATH, lambda d: d.__setitem__(account, clean))
         print(f"  Cached page URL for {account}: {clean}")
 
 DEFAULT_MIN_DELAY = 45
@@ -471,20 +468,15 @@ def capture_published_post(page) -> dict | None:
 
 def save_last_post(account_name: str, post_info: dict | None) -> None:
     """Record what post.py just published so boost.py can verify it's
-    boosting the right post instead of inferring "most recent" blind."""
-    data = {}
-    if LAST_POST_PATH.exists():
-        try:
-            data = json.loads(LAST_POST_PATH.read_text())
-        except Exception as exc:
-            log.debug("could not read existing last_post.json, overwriting: %s", exc)
-            data = {}
-    data[account_name] = {
+    boosting the right post instead of inferring "most recent" blind.
+    Batch runs call this from several profiles at once, so it goes through
+    update_json() rather than a bare read-modify-write."""
+    record = {
         "post_id": post_info.get("post_id") if post_info else None,
         "url": post_info.get("url") if post_info else None,
         "published_at": datetime.now(timezone.utc).isoformat(),
     }
-    LAST_POST_PATH.write_text(json.dumps(data, indent=2))
+    update_json(LAST_POST_PATH, lambda data: data.__setitem__(account_name, record))
 
 
 def publish_post(page, post, index, page_url="https://www.facebook.com/", image_path=None, navigate=True):

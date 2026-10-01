@@ -48,3 +48,7 @@ __pycache__/
 
 # Distribution bundles (have contained .env with live credentials)
 *.zip
+
+# Runtime state: lock/temp files from state_file.update_json
+*.json.lock
+*.json.*.tmp
