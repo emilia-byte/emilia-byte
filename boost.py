@@ -64,7 +64,6 @@ def ensure_mlx_credentials():
 
     print("\n── Multilogin credentials ────────────────────────────────")
     print("(Saved to .env so you only need to enter them once.)\n")
-
     if not values["MLX_EMAIL"]:
         values["MLX_EMAIL"] = input("  Multilogin email: ").strip()
     if not values["MLX_PASSWORD"]:
@@ -79,6 +78,7 @@ def ensure_textverified_credentials():
     """Only needed if we're actually going to click Publish -- SMS
     verification can't trigger on a campaign left as a draft, so a
     draft-only run should never have to provide these."""
+    _load_dotenv()
     values = {k: os.environ.get(k, "").strip() for k in ["TEXTVERIFIED_API_KEY", "TEXTVERIFIED_USERNAME"]}
     if all(values.values()):
         return
@@ -90,7 +90,6 @@ def ensure_textverified_credentials():
         values["TEXTVERIFIED_API_KEY"] = input("  TextVerified API key: ").strip()
     if not values["TEXTVERIFIED_USERNAME"]:
         values["TEXTVERIFIED_USERNAME"] = input("  TextVerified username (email): ").strip()
-
     for k, v in values.items():
         os.environ[k] = v
     _save_env(values)
@@ -98,19 +97,47 @@ def ensure_textverified_credentials():
 
 # ── Account picker ────────────────────────────────────────────────────────────
 
+def _run_sync():
+    import subprocess
+    subprocess.run([sys.executable, str(ROOT / "sync_profiles.py")], cwd=str(ROOT), env=os.environ.copy())
+
+
 def pick_account() -> str:
+    import json
     from mlx_context import list_accounts
+
+    profiles_file = ROOT / "mlx_profiles.json"
+    if not profiles_file.exists():
+        print("\nNo profiles file found — syncing from Multilogin now...")
+        _run_sync()
+
     accounts = list_accounts()
 
-    print("\n── Accounts ──────────────────────────────────────────────")
-    for i, name in enumerate(accounts, 1):
-        print(f"  {i}. {name}")
+    def _show_list():
+        print("\n── Accounts ──────────────────────────────────────────────")
+        for i, name in enumerate(accounts, 1):
+            print(f"  {i}. {name}")
+        print( "  S. Sync profiles from Multilogin")
+        print( "  Or type a profile name directly (e.g. EMI_AUTO_3)")
+
+    _show_list()
 
     while True:
-        choice = input(f"\n  Pick an account [1-{len(accounts)}]: ").strip()
-        if choice.isdigit() and 1 <= int(choice) <= len(accounts):
+        choice = input(f"\n  Pick [1-{len(accounts)}], S to sync, or type a name: ").strip()
+
+        if choice.lower() == "s":
+            _run_sync()
+            accounts = list_accounts()
+            _show_list()
+
+        elif choice.isdigit() and 1 <= int(choice) <= len(accounts):
             return accounts[int(choice) - 1]
-        print("  Please enter a number from the list.")
+
+        elif choice:
+            return choice  # start_profile_for resolves via live API lookup if not in local map
+
+        else:
+            print("  Please enter a number, S to sync, or a profile name.")
 
 
 def ask_publish_mode() -> bool:
@@ -235,7 +262,10 @@ async def _handle_verification(page) -> bool:
                 except Exception as exc:
                     log.debug("code-submit button %r failed: %s", label, exc)
                     continue
-            await page.wait_for_load_state("networkidle")
+            try:
+                await page.wait_for_load_state("domcontentloaded", timeout=30000)
+            except Exception as exc:
+                log.debug("_handle_verification: ignored error: %s", exc)
             tv.verifications.cancel(verification.id)
             return True
         else:
@@ -316,13 +346,45 @@ async def select_target_post(page, account: str) -> str | None:
         return None
 
 
+# ── Auth popup dismissal ──────────────────────────────────────────────────────
+
+async def _dismiss_auth_prompt(page) -> bool:
+    """Dismiss Facebook identity/security prompts that interrupt the ad creation flow.
+    Only acts when the page actually contains auth/verification language."""
+    auth_keywords = ["verify your identity", "confirm your identity", "identity verification",
+                     "security check", "confirm it's you", "verifica tu identidad"]
+    body = (await page.evaluate("() => document.body.innerText")).lower()
+    if not any(kw in body for kw in auth_keywords):
+        return False
+    for label in ["Not now", "Skip", "Maybe later", "Remind me later"]:
+        try:
+            btn = page.get_by_role("button", name=re.compile(rf"^{re.escape(label)}$", re.I))
+            if await btn.count() > 0:
+                await btn.first.click(timeout=3000)
+                await page.wait_for_timeout(600)
+                return True
+        except Exception as exc:
+            log.debug("_dismiss_auth_prompt: ignored error: %s", exc)
+            continue
+    return False
+
+
 # ── Main ad creation flow ─────────────────────────────────────────────────────
 
 async def boost(cdp_url: str, account: str, publish: bool = False):
     from playwright.async_api import async_playwright
 
     async with async_playwright() as p:
-        browser = await p.chromium.connect_over_cdp(cdp_url)
+        browser = None
+        for attempt in range(10):
+            try:
+                browser = await p.chromium.connect_over_cdp(cdp_url)
+                break
+            except Exception as exc:
+                log.debug("boost: ignored error: %s", exc)
+                if attempt == 9:
+                    raise
+                await asyncio.sleep(3)
         context = browser.contexts[0]
         page = context.pages[0] if context.pages else await context.new_page()
 
@@ -335,12 +397,28 @@ async def boost(cdp_url: str, account: str, publish: bool = False):
             "(u) => { window.location.href = u; }",
             "https://adsmanager.facebook.com/adsmanager/manage/campaigns",
         )
-        await page.wait_for_load_state("domcontentloaded", timeout=30000)
+        try:
+            await page.wait_for_load_state("domcontentloaded", timeout=30000)
+        except Exception as exc:
+            log.debug("boost: ignored error: %s", exc)
         try:
             await page.wait_for_selector("text=Campaigns", timeout=30000)
         except Exception as exc:
-            log.debug("Campaigns header wait failed: %s", exc)
+            log.debug("boost: ignored error: %s", exc)
         await page.wait_for_timeout(2000)
+        await _dismiss_auth_prompt(page)
+
+        # ── Dismiss policy / consent modals ──────────────────────
+        for label in ["I accept", "Accept", "Got it", "OK", "Continue"]:
+            try:
+                btn = page.get_by_role("button", name=re.compile(rf"^{re.escape(label)}$", re.I))
+                if await btn.count() > 0 and await btn.first.is_visible(timeout=3000):
+                    await btn.first.click(timeout=5000)
+                    await page.wait_for_timeout(1500)
+                    print(f"  Dismissed policy modal: '{label}'")
+            except Exception as exc:
+                log.debug("boost: ignored error: %s", exc)
+                continue
 
         # ── Create campaign ───────────────────────────────────────
         print("Creating campaign...")
@@ -373,142 +451,180 @@ async def boost(cdp_url: str, account: str, publish: bool = False):
                 log.debug("fallback Create button match failed: %s", exc)
 
         if not clicked:
-            raise RuntimeError("Could not find the + Create campaign button in Ads Manager.")
+            await page.screenshot(path=str(ROOT / "debug_create.png"))
+            raise RuntimeError("Could not find the + Create campaign button in Ads Manager. Screenshot saved to debug_create.png")
         await page.wait_for_timeout(1500)
 
-        # Some accounts show a "Loading creation..." spinner before the
-        # objective modal actually renders — wait it out or the Engagement
-        # click below can land before the dialog content exists.
+        # Wait for "Loading creation" spinner to fully disappear before interacting.
+        # Use wait_for_function polling the DOM text directly — more reliable than
+        # selector state on slow networks where the overlay can persist well past 20s.
+        print("  Waiting for creation dialog to load...")
         try:
-            await page.wait_for_selector("text=Loading creation", state="hidden", timeout=20000)
-        except Exception as exc:
-            log.debug("Loading-creation spinner wait failed: %s", exc)
-
-        # Current Ads Manager UI: modal shows objective radio buttons directly.
-        # No "Manual campaign" step — just select Engagement and Continue.
-        # Scope to the dialog: a bare "text=Engagement" can match a leftover
-        # draft campaign named "New Engagement Campaign" in the table behind
-        # the modal, which then hangs waiting to click through a side panel.
-        await page.click('div[role="dialog"] :text("Engagement")')
-        await page.wait_for_timeout(800)
-        continue_btn = page.locator('div[role="dialog"]').get_by_role(
-            "button", name=re.compile(r"^Continue$", re.I)
-        )
-        await continue_btn.click(timeout=10000)
-        await page.wait_for_timeout(1500)
-
-        # Second dialog: "Choose a campaign setup" — Recommended vs Manual.
-        # We want full manual control (targeting, post selection), not
-        # Advantage+ presets.
-        try:
-            await page.locator('div[role="dialog"] :text("Manual")').first.click(timeout=8000)
-            await page.wait_for_timeout(800)
-            manual_continue = page.locator('div[role="dialog"]').get_by_role(
-                "button", name=re.compile(r"^Continue$", re.I)
+            await page.wait_for_function(
+                "() => !document.body.innerText.includes('Loading creation')",
+                timeout=90000,
             )
-            await manual_continue.click(timeout=8000)
+        except Exception as exc:
+            log.debug("boost: ignored error: %s", exc)
+        await page.wait_for_timeout(2000)
+        await _dismiss_auth_prompt(page)
+
+        # If we landed directly on the campaign editor (Facebook remembers the last objective
+        # and skips the picker), the "Next" button will already be present — skip ahead.
+        already_on_editor = await page.get_by_role("button", name=re.compile(r"^Next$", re.I)).count() > 0
+
+        if not already_on_editor:
+            # Objective picker is showing — click Engagement then Continue
+            engagement_clicked = False
+            for locator in [
+                page.get_by_text("Engagement", exact=True),
+                page.locator('div[role="dialog"] :text("Engagement")'),
+                page.locator(':text("Engagement")').filter(has_not_text="New").filter(has_not_text="Post"),
+            ]:
+                try:
+                    await locator.first.click(timeout=6000)
+                    engagement_clicked = True
+                    break
+                except Exception as exc:
+                    log.debug("boost: ignored error: %s", exc)
+                    continue
+            if not engagement_clicked:
+                await page.screenshot(path=str(ROOT / "debug_after_create.png"))
+                raise RuntimeError("Could not find Engagement objective — check debug_after_create.png")
+            await page.wait_for_timeout(800)
+
+            for locator in [
+                page.locator('div[role="dialog"]').get_by_role("button", name=re.compile(r"^Continue$", re.I)),
+                page.get_by_role("button", name=re.compile(r"^Continue$", re.I)),
+            ]:
+                try:
+                    await locator.click(timeout=6000)
+                    break
+                except Exception as exc:
+                    log.debug("boost: ignored error: %s", exc)
+                    continue
+            await page.wait_for_timeout(1500)
+
+        # Some accounts show a second "Manual vs Recommended" dialog
+        try:
+            await page.locator('div[role="dialog"] :text("Manual")').first.click(timeout=6000)
+            await page.wait_for_timeout(800)
+            await page.locator('div[role="dialog"]').get_by_role(
+                "button", name=re.compile(r"^Continue$", re.I)
+            ).click(timeout=6000)
             await page.wait_for_timeout(1200)
         except Exception as exc:
-            log.debug("Manual-setup dialog step skipped: %s", exc)  # some accounts may skip straight past this dialog
+            log.debug("boost: ignored error: %s", exc)
 
-        # Single-page campaign editor (Campaign name / details / Budget) —
-        # click Next to move to the Ad set section. Not a real <button>.
-        next_btn = page.get_by_role("button", name=re.compile(r"^Next$", re.I))
-        await next_btn.click(timeout=10000)
+        # Campaign editor page — click Next to reach the Ad Set section
+        next_clicked = False
+        for locator in [
+            page.get_by_role("button", name=re.compile(r"^Next$", re.I)),
+            page.locator('button:has-text("Next")'),
+            page.locator('div[role="button"]:has-text("Next")'),
+        ]:
+            try:
+                await locator.first.click(timeout=6000)
+                next_clicked = True
+                break
+            except Exception as exc:
+                log.debug("boost: ignored error: %s", exc)
+                continue
+        if not next_clicked:
+            await page.screenshot(path=str(ROOT / "debug_next.png"))
+            raise RuntimeError("Could not find the Next button on campaign editor. Screenshot saved to debug_next.png")
         await page.wait_for_timeout(1500)
 
         # ── Ad set ────────────────────────────────────────────────
         print("Configuring ad set...")
-        # "Conversion location" dropdown replaces the old standalone
-        # "On your ad" / "Post engagement" clicks.
+        # "On your ad" is an option inside the "Message destinations" dropdown
         await page.click("text=Message destinations", timeout=10000)
         await page.wait_for_timeout(600)
         await page.click('text="On your ad"', timeout=8000)
         await page.wait_for_timeout(1000)
 
-        # "Engagement type" dropdown defaults to "Video views" — switch to
-        # "Post engagement" since our posts are image/text, not video.
+        # Switch engagement type from default "Video views" to "Post engagement"
         try:
             await page.click("text=Video views", timeout=8000)
             await page.wait_for_timeout(600)
             await page.click("text=Post engagement", timeout=5000)
             await page.wait_for_timeout(800)
         except Exception as exc:
-            log.debug("Engagement-type dropdown skipped: %s", exc)  # already set, or account defaults differently
+            log.debug("boost: ignored error: %s", exc)
+            pass  # already set, or account defaults differently
 
-        # Location targeting lives inside "Audience controls", not rendered
-        # until scrolled near — some accounts' Ad Set page isn't virtualized
-        # (the section exists in the DOM immediately) and some accounts'
-        # is (it only attaches once scrolled close), so scroll by mouse
-        # wheel checking cheap DOM-presence rather than full visibility,
-        # then do a precise native scrollIntoView once it's attached.
+        # Location targeting — scroll the inner form container (Ads Manager doesn't use window scroll)
         print("Setting location: Paraguay...")
-        box = await page.locator("text=Conversion").first.bounding_box()
-        if box:
-            await page.mouse.move(box["x"] + 50, box["y"] + 10)
+
+        async def scroll_form(amount):
+            vp = page.viewport_size or {"width": 1280, "height": 800}
+            # 50% width lands in the main form area, not the left campaign tree panel
+            x = int(vp["width"] * 0.50)
+            y = int(vp["height"] * 0.5)
+            await page.mouse.move(x, y)
+            await page.mouse.wheel(0, amount)
+
+        # Expand hidden audience/location fields if collapsed
+        try:
+            await page.click("text=Show more options", timeout=3000)
+            await page.wait_for_timeout(800)
+        except Exception as exc:
+            log.debug("boost: ignored error: %s", exc)
 
         included = page.locator("text=Included location:").first
-        attached = False
-        for _ in range(30):
+        for _ in range(40):
             if await included.count() > 0:
-                attached = True
-                break
-            await page.mouse.wheel(0, 150)
-            await page.wait_for_timeout(250)
-        if not attached:
-            raise RuntimeError("Never reached the Locations section.")
+                visible = await included.is_visible()
+                if visible:
+                    break
+            await scroll_form(200)
+            await page.wait_for_timeout(200)
 
         inc_handle = await included.element_handle()
         await page.evaluate(
-            "el => el.scrollIntoView({block: 'center', behavior: 'instant'})",
-            inc_handle,
+            "el => el.scrollIntoView({block: 'center', behavior: 'instant'})", inc_handle
         )
-        await page.wait_for_timeout(800)
+        await page.wait_for_timeout(1000)
 
-        # The "* Locations" heading row carries its own "Edit" link (not
-        # the page's "Show more options", which expands age/gender
-        # instead) — but on some accounts it only renders after the
-        # location chip itself is clicked to "activate" the box. Anchor
-        # proximity search on the heading, not "Included location:" — the
-        # Edit link sits level with the heading, above the location list.
-        inc_box = await included.bounding_box(timeout=10000)
-        heading_box = await page.locator("text=* Locations").first.bounding_box()
-        anchor_box = heading_box or inc_box
+        # Click the Edit link nearest to the Locations heading
+        heading = page.locator("text=* Locations").first
+        heading_box = await heading.bounding_box()
+        anchor_box = heading_box or await included.bounding_box()
 
-        def nearest_below(label):
-            async def _find():
-                candidates = await page.locator(label).all()
-                best, best_dy = None, None
-                for c in candidates:
-                    cbox = await c.bounding_box()
-                    if cbox and anchor_box and cbox["y"] >= anchor_box["y"] - 5:
-                        dy = cbox["y"] - anchor_box["y"]
-                        if best_dy is None or dy < best_dy:
-                            best_dy, best = dy, c
-                return best
-            return _find()
+        async def nearest_edit():
+            best, best_dy = None, None
+            for c in await page.locator('text="Edit"').all():
+                cbox = await c.bounding_box()
+                if cbox and anchor_box and cbox["y"] >= anchor_box["y"] - 5:
+                    dy = cbox["y"] - anchor_box["y"]
+                    if best_dy is None or dy < best_dy:
+                        best_dy, best = dy, c
+            return best
 
-        best = await nearest_below('text="Edit"')
-        if best is None:
+        edit_btn = await nearest_edit()
+        if edit_btn is None:
             # Clicking anywhere in the location summary "activates" the box
             # and reveals its Edit link on some accounts.
             try:
                 await included.click(timeout=5000)
                 await page.wait_for_timeout(800)
-                best = await nearest_below('text="Edit"')
+                edit_btn = await nearest_edit()
             except Exception as exc:
                 log.debug("Locations 'Edit' link activation-click failed: %s", exc)
-        if best is None:
-            raise RuntimeError("Could not find the Locations 'Edit' link.")
-        await best.click(timeout=8000)
+        if edit_btn is None:
+            await page.screenshot(path=str(ROOT / "debug_location.png"))
+            raise RuntimeError("Could not find the Locations Edit link. Screenshot saved to debug_location.png")
+        await edit_btn.click(timeout=8000)
         await page.wait_for_timeout(1000)
 
+        # Find the country search input (label varies by account)
         search = None
         for sel in [
             'input[placeholder*="ountry" i]',
             'input[placeholder*="ocation" i]',
             'input[aria-label*="ocation" i]',
             'div[role="dialog"] input[type="text"]',
+            'input[aria-label="Add locations"]',
         ]:
             try:
                 cand = page.locator(sel).first
@@ -516,31 +632,42 @@ async def boost(cdp_url: str, account: str, publish: bool = False):
                     search = cand
                     break
             except Exception as exc:
-                log.debug("location search input %r failed: %s", sel, exc)
+                log.debug("boost: ignored error: %s", exc)
                 continue
         if not search:
             raise RuntimeError("No location search input found after clicking Edit.")
+
+        # Add Paraguay first, then remove any chip that is not Paraguay
         await search.fill("Paraguay")
         await page.wait_for_timeout(1000)
-        # Press Enter rather than clicking a result row — "Paraguay" also
-        # substring-matches city results ("Asunción, Paraguay" etc.), so a
-        # has-text click is ambiguous. Enter takes the top (country) match.
         await search.press("Enter")
         await page.wait_for_timeout(1000)
 
-        next_btn2 = page.get_by_role("button", name=re.compile(r"^Next$", re.I))
-        await next_btn2.click(timeout=10000)
-        await page.wait_for_load_state("networkidle")
+        for _ in range(10):
+            try:
+                btns = await page.query_selector_all('div[aria-label^="Remove "]')
+                removed = False
+                for btn in btns:
+                    label = await btn.get_attribute("aria-label") or ""
+                    if "Paraguay" not in label:
+                        await btn.click()
+                        await page.wait_for_timeout(400)
+                        removed = True
+                        break
+                if not removed:
+                    break
+            except Exception as exc:
+                log.debug("boost: ignored error: %s", exc)
+                break
 
-        # ── Ad level: select most recent post ─────────────────────
+        await page.get_by_role("button", name=re.compile(r"^Next$", re.I)).click(timeout=10000)
+        try:
+            await page.wait_for_load_state("domcontentloaded", timeout=30000)
+        except Exception as exc:
+            log.debug("boost: ignored error: %s", exc)
+
+        # ── Ad level: select existing post ────────────────────────
         print("Selecting most recent post...")
-        # Scroll position carries over from the Ad Set page. On some
-        # accounts the "Ad setup" dropdown's own text isn't a reliable
-        # scroll target -- its closed-state value is duplicated elsewhere
-        # in the DOM as a permanently display:none legacy node (same
-        # text, but genuinely no layout box, so scrollIntoView on *that*
-        # copy is a no-op and the real one never gets its own scroll).
-        # The "Ad setup" heading right above it doesn't have that problem.
         try:
             ad_setup_heading = page.locator("text=Ad setup").first
             await ad_setup_heading.wait_for(state="attached", timeout=8000)
@@ -552,7 +679,14 @@ async def boost(cdp_url: str, account: str, publish: bool = False):
             await page.wait_for_timeout(500)
         except Exception as exc:
             log.debug("Ad setup heading scroll failed: %s", exc)
-        await page.click("text=Use existing post")
+        use_existing = page.locator("text=Use existing post").first
+        await use_existing.wait_for(state="attached", timeout=15000)
+        for _ in range(20):
+            if await use_existing.is_visible():
+                break
+            await scroll_form(200)
+            await page.wait_for_timeout(200)
+        await use_existing.click(timeout=10000)
         await page.wait_for_timeout(1000)
         await page.click("text=Select post")
         await page.wait_for_timeout(2000)
@@ -564,9 +698,18 @@ async def boost(cdp_url: str, account: str, publish: bool = False):
         await select_target_post(page, account)
         await page.wait_for_timeout(1000)
 
-        continue_post_btn = page.get_by_role("button", name=re.compile(r"^Continue$", re.I))
-        await continue_post_btn.click(timeout=8000)
-        await page.wait_for_load_state("networkidle")
+        for label in ["Continue", "Select"]:
+            try:
+                await page.click(f'button:has-text("{label}")', timeout=4000)
+                break
+            except Exception as exc:
+                log.debug("boost: ignored error: %s", exc)
+                continue
+        try:
+            await page.wait_for_load_state("domcontentloaded", timeout=30000)
+        except Exception as exc:
+            log.debug("boost: ignored error: %s", exc)
+
 
         # ── Publish (or leave as a draft) ───────────────────────────
         if not publish:
@@ -578,7 +721,21 @@ async def boost(cdp_url: str, account: str, publish: bool = False):
             return
 
         print("Publishing campaign...")
-        await page.click('button:has-text("Publish")')
+        publish_clicked = False
+        for locator in [
+            page.get_by_role("button", name=re.compile(r"publish", re.I)),
+            page.locator('button:has-text("Publish")'),
+            page.locator('div[role="button"]:has-text("Publish")'),
+        ]:
+            try:
+                await locator.first.click(timeout=10000)
+                publish_clicked = True
+                break
+            except Exception as exc:
+                log.debug("boost: ignored error: %s", exc)
+                continue
+        if not publish_clicked:
+            raise RuntimeError("Could not find the Publish button.")
         await page.wait_for_timeout(3000)
 
         # ── SMS verification (if triggered) ───────────────────────
@@ -634,4 +791,3 @@ if __name__ == "__main__":
         print("\n\nCancelled.")
     except Exception as exc:
         print(f"\n\nError: {exc}")
-    input("\nPress Enter to close...")

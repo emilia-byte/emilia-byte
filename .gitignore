@@ -31,6 +31,9 @@ last_post.json
 # Runtime state: last-used destination URL, remembered between generate_posts.py runs
 current_url.json
 
+# Runtime state: templates already used, so generate_posts.py avoids repeats
+used_content.json
+
 # One-off generation scripts
 make_demo_brief.py
 make_arch_pdf.py
@@ -42,3 +45,6 @@ __pycache__/
 
 # macOS
 .DS_Store
+
+# Distribution bundles (have contained .env with live credentials)
+*.zip

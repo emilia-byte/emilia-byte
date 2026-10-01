@@ -41,7 +41,8 @@ def test_extract_category_picks_last_matching_token():
 
 @pytest.mark.parametrize("category", list(TEMPLATES.keys()))
 def test_build_post_returns_nonempty_text_and_known_image(category):
-    post, image = build_post(category, used_openers=set(), used_closers=set())
+    post, image = build_post(category, used_openers=set(), used_closers=set(),
+                             used_images=set(), used_bodies=set())
 
     assert isinstance(post, str) and post.strip()
     assert image in TEMPLATES[category]["images"]
@@ -52,7 +53,7 @@ def test_build_post_avoids_reusing_opener_and_closer_within_a_run():
     used_openers = set(t["openers"][:-1])  # all but one opener already used
     used_closers = set()
 
-    post, _ = build_post("Lifestyle", used_openers, used_closers)
+    post, _ = build_post("Lifestyle", used_openers, used_closers, set(), set())
 
     remaining_opener = t["openers"][-1]
     assert remaining_opener in post

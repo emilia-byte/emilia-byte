@@ -34,6 +34,52 @@ from fb_dom import js_navigate
 
 log = logging.getLogger(__name__)
 
+PAGE_URLS_PATH = Path(__file__).parent / "page_urls.json"
+
+
+def _load_page_urls() -> dict:
+    try:
+        return json.loads(PAGE_URLS_PATH.read_text())
+    except Exception as exc:
+        log.debug("_load_page_urls: ignored error: %s", exc)
+        return {}
+
+
+_INVALID_PAGE_SLUGS = {
+    "professional_dashboard", "professional-dashboard", "dashboard",
+    "creatorstudio", "pages", "settings", "notifications", "help",
+    "login", "marketplace", "groups", "events", "bookmarks", "watch",
+    "friends", "memories", "saved", "videos", "photos", "reels",
+    "business", "ads", "about", "privacy", "policies", "terms",
+    "fundraisers", "climate", "jobs", "facebook", "messenger", "instagram",
+}
+
+
+def _is_valid_page_url(url: str) -> bool:
+    """Return True only if url looks like a real Facebook Page (not a dashboard or tool)."""
+    clean = url.split("?")[0].rstrip("/")
+    slug = clean.replace("https://www.facebook.com/", "").strip("/")
+    if not slug or slug in _INVALID_PAGE_SLUGS:
+        return False
+    if "/" in slug and not slug.startswith("pages/"):
+        return False
+    return True
+
+
+def _save_page_url(account: str, url: str) -> None:
+    data = _load_page_urls()
+    id_match = re.search(r'[?&]id=(\d+)', url)
+    if id_match:
+        clean = f"https://www.facebook.com/{id_match.group(1)}"
+    else:
+        clean = url.split("?")[0].rstrip("/")
+    if not _is_valid_page_url(clean):
+        return
+    if data.get(account) != clean:
+        data[account] = clean
+        PAGE_URLS_PATH.write_text(json.dumps(data, indent=2) + "\n")
+        print(f"  Cached page URL for {account}: {clean}")
+
 DEFAULT_MIN_DELAY = 45
 DEFAULT_MAX_DELAY = 90
 
@@ -94,37 +140,52 @@ def human_pause(min_s=0.8, max_s=2.0):
 
 
 def open_composer(page):
-    """Click 'What's on your mind?' in the main feed only, then wait for the dialog."""
+    """Click 'What's on your mind?' then wait for the dialog to open."""
     human_pause(1.0, 1.5)
 
-    for selector in [
+    # Scroll down slightly so the composer box comes into view
+    try:
+        page.evaluate("window.scrollBy(0, 300)")
+        human_pause(0.5, 1.0)
+    except Exception as exc:
+        log.debug("open_composer: ignored error: %s", exc)
+
+    COMPOSER_SELECTORS = [
         "div[role='main'] div[role='button']:has-text(\"What's on your mind\")",
         "div[role='main'] div[aria-label*=\"What's on your mind\"]",
         "div[role='main'] span:has-text(\"What's on your mind\")",
         "div[role='button']:has-text(\"What's on your mind\")",
         "[aria-label*=\"What's on your mind\"]",
-    ]:
+    ]
+    CONFIRM_SELECTORS = [
+        "div[contenteditable='true'][role='textbox']",
+        "div[role='dialog']",
+        "div[aria-label='Create post']",
+    ]
+
+    for selector in COMPOSER_SELECTORS:
         try:
             el = page.locator(selector).first
-            if el.is_visible():
-                el.click()
-                human_pause(2.0, 3.0)
-                # Confirm dialog opened by waiting for the textbox, not role='dialog'
-                # (Facebook Pages use a different container structure)
-                for confirm in [
-                    "div[contenteditable='true'][role='textbox']",
-                    "div[role='dialog']",
-                    "div[aria-label='Create post']",
-                ]:
-                    try:
-                        page.wait_for_selector(confirm, timeout=5000)
-                        human_pause(1.0, 1.5)
-                        return True
-                    except Exception as exc:
-                        log.debug("composer confirm selector %r not found: %s", confirm, exc)
-                        continue
+            if el.count() == 0:
+                continue
+            # Scroll element into view even if partially off-screen
+            try:
+                el.scroll_into_view_if_needed(timeout=3000)
+                human_pause(0.3, 0.6)
+            except Exception as exc:
+                log.debug("open_composer: ignored error: %s", exc)
+            el.click()
+            human_pause(2.0, 3.0)
+            for confirm in CONFIRM_SELECTORS:
+                try:
+                    page.wait_for_selector(confirm, timeout=5000)
+                    human_pause(1.0, 1.5)
+                    return True
+                except Exception as exc:
+                    log.debug("open_composer: ignored error: %s", exc)
+                    continue
         except Exception as exc:
-            log.debug("composer open selector %r failed: %s", selector, exc)
+            log.debug("open_composer: ignored error: %s", exc)
             continue
 
     try:
@@ -184,7 +245,59 @@ def submit_post(page):
         "div[role='dialog'] [data-testid='react-composer-post-button']",
     ]
 
-    if not _click_first_visible(all_selectors):
+    # Wait up to 20s for the submit button to become enabled.
+    # It's disabled while an image is uploading or in an error state.
+    enabled_sel = (
+        "div[role='dialog'] div[aria-label='Next'][role='button']:not([aria-disabled='true']), "
+        "div[role='dialog'] div[aria-label='Post'][role='button']:not([aria-disabled='true']), "
+        "div[role='dialog'] div[role='button']:not([aria-disabled='true']):has-text('Next'), "
+        "div[role='dialog'] div[role='button']:not([aria-disabled='true']):has-text('Post')"
+    )
+    try:
+        page.wait_for_selector(enabled_sel, timeout=20000)
+    except Exception as exc:
+        log.debug("submit_post: ignored error: %s", exc)
+        # Button still disabled — attachment failed or is stuck. Clear it.
+        print("Submit button not ready — clearing any stuck attachment...")
+        # Text-based check first (covers the explicit "can't be uploaded" error)
+        try:
+            dialog = page.locator("div[role='dialog']")
+            if dialog.filter(has_text="can't be uploaded").count() > 0:
+                print("File upload error detected.")
+        except Exception as exc:
+            log.debug("submit_post: ignored error: %s", exc)
+        # Remove any visible attachment regardless of error text
+        for rm_sel in [
+            "div[role='dialog'] [aria-label*='Remove']",
+            "div[role='dialog'] [aria-label*='remove']",
+        ]:
+            try:
+                rm = page.locator(rm_sel).first
+                if rm.count() > 0 and rm.is_visible():
+                    rm.click()
+                    human_pause(2.0, 3.0)
+                    break
+            except Exception as exc:
+                log.debug("submit_post: ignored error: %s", exc)
+                continue
+
+    clicked = _click_first_visible(all_selectors)
+
+    # Last resort: force-click even if aria-disabled
+    if not clicked:
+        for selector in all_selectors:
+            try:
+                el = page.locator(selector).last
+                if el.count() > 0:
+                    el.click(force=True)
+                    clicked = True
+                    print("Force-clicked submit button.")
+                    break
+            except Exception as exc:
+                log.debug("submit_post: ignored error: %s", exc)
+                continue
+
+    if not clicked:
         return False
 
     # Handle the Next → Post two-step flow (common with link previews):
@@ -222,8 +335,25 @@ def attach_image(page, image_path: Path) -> bool:
             with page.expect_file_chooser(timeout=5000) as fc_info:
                 locator.click()
             fc_info.value.set_files(str(image_path))
-            print(f"Image attached: {image_path.name}")
-            human_pause(3.0, 5.0)
+            # Wait for Facebook to render the image preview thumbnail before proceeding.
+            # Without this, submit_post() fires while the upload is still in flight.
+            preview_appeared = False
+            for sel in [
+                "div[role='dialog'] [aria-label*='Remove']",
+                "div[role='dialog'] img[src^='blob:']",
+            ]:
+                try:
+                    page.wait_for_selector(sel, timeout=20000)
+                    preview_appeared = True
+                    break
+                except Exception as exc:
+                    log.debug("_via_chooser: ignored error: %s", exc)
+                    continue
+            if preview_appeared:
+                print(f"Image attached: {image_path.name}")
+            else:
+                print(f"Image set (no preview visible): {image_path.name}")
+            human_pause(1.0, 2.0)
             return True
         except Exception as exc:
             log.debug("file-chooser attach failed: %s", exc)
@@ -361,12 +491,32 @@ def publish_post(page, post, index, page_url="https://www.facebook.com/", image_
     print(f"\n── Post {index + 1} {'(with link)' if post['url'] else ''} {'📷' if image_path else ''} ──")
 
     if navigate:
-        js_navigate(page, page_url)
+        for attempt in range(4):
+            js_navigate(page, page_url)
+            try:
+                page.wait_for_selector("div[role='main']", timeout=30000)
+                break
+            except Exception as exc:
+                log.debug("publish_post: ignored error: %s", exc)
+                if attempt == 3:
+                    print("Page failed to load after 4 attempts — continuing anyway.")
+                    break
+                wait = [5, 10, 20][attempt]
+                print(f"Page load failed (attempt {attempt + 1}/4), retrying in {wait}s...")
+                time.sleep(wait)
         human_pause(2.5, 4.0)
     else:
         # After a previous post the dialog closes and we're still on the page feed.
         # Scroll to top instantly so the "What's on your mind?" button is in view.
         human_pause(2.0, 3.0)
+        # Dismiss any dialog left open from a previous failed post
+        try:
+            close_btn = page.locator("div[role='dialog'] [aria-label='Close'], div[role='dialog'] [aria-label='close']").first
+            if close_btn.is_visible():
+                close_btn.click()
+                human_pause(1.0, 1.5)
+        except Exception as exc:
+            log.debug("publish_post: ignored error: %s", exc)
         try:
             page.evaluate("window.scrollTo({top: 0, behavior: 'instant'})")
         except Exception as exc:
@@ -402,9 +552,13 @@ def publish_post(page, post, index, page_url="https://www.facebook.com/", image_
     if post["url"]:
         human_pause(0.5, 1.2)
         print(f"Adding URL: {post['url']}")
-        page.keyboard.press("Escape")  # dismiss any hashtag autocomplete
-        human_pause(0.2, 0.4)
-        page.keyboard.press("End")
+        try:
+            textbox = page.locator("div[role='dialog'] div[role='textbox'][contenteditable='true']").first
+            textbox.click()
+            human_pause(0.5, 0.8)
+        except Exception as exc:
+            log.debug("publish_post: ignored error: %s", exc)
+        page.keyboard.press("Control+End")  # move cursor to absolute end of content
         page.keyboard.press("Enter")
         page.keyboard.press("Enter")  # blank line between hashtags and URL
         human_type(page, post["url"])
@@ -425,106 +579,226 @@ def publish_post(page, post, index, page_url="https://www.facebook.com/", image_
     return True
 
 
-def run(account_name, posts_path, min_delay=DEFAULT_MIN_DELAY, max_delay=DEFAULT_MAX_DELAY):
+def _switch_to_page_if_prompted(page) -> bool:
+    """Click 'Switch Now' if Facebook shows a page-switch prompt. Returns True if clicked."""
+    for sw in [
+        page.get_by_role("button", name=re.compile(r"switch now", re.I)),
+        page.get_by_role("link",   name=re.compile(r"switch now", re.I)),
+        page.locator("div[role='button']:has-text('Switch Now'), a:has-text('Switch Now')"),
+    ]:
+        try:
+            if sw.count() > 0:
+                print("Clicking Switch Now...")
+                sw.first.click()
+                try:
+                    page.wait_for_load_state("domcontentloaded", timeout=60000)
+                except Exception as exc:
+                    log.debug("_switch_to_page_if_prompted: ignored error: %s", exc)
+                human_pause(2.0, 3.0)
+                return True
+        except Exception as exc:
+            log.debug("_switch_to_page_if_prompted: ignored error: %s", exc)
+    return False
+
+
+def _setup_session(page, account_name: str = ""):
+    """Ensure we're in the page posting context. Returns the active page URL."""
+    base_urls = {"https://www.facebook.com/", "https://www.facebook.com", "https://m.facebook.com/"}
+
+    # If we have a valid cached URL, use it — navigate if not already there
+    if account_name:
+        cached_url = _load_page_urls().get(account_name)
+        if cached_url and not _is_valid_page_url(cached_url):
+            cached_url = None
+        if cached_url:
+            cached_id = cached_url.rstrip("/").split("/")[-1]
+            already_there = cached_id and cached_id in page.url
+            print(f"Using cached page URL: {cached_url}")
+            if not already_there:
+                js_navigate(page, cached_url)
+                try:
+                    page.wait_for_load_state("domcontentloaded", timeout=15000)
+                except Exception as exc:
+                    log.debug("_setup_session: ignored error: %s", exc)
+                human_pause(2.0, 3.0)
+            _switch_to_page_if_prompted(page)
+            return page.url
+
+    if "www.facebook.com" not in page.url:
+        js_navigate(page, "https://www.facebook.com/")
+        human_pause(2.0, 3.0)
+
+    if "login" in page.url:
+        raise RuntimeError("Not logged in — run manual_session.py first.")
+
+    try:
+        if page.locator("input[name='email'], input[type='email']").count() > 0:
+            raise RuntimeError("Facebook session expired — re-login via Multilogin first.")
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        log.debug("_setup_session: ignored error: %s", exc)
+
+    SUFFIXES = ["LS", "HOB", "CSI", "MF"]
+    already_on_page = page.url not in base_urls and any(
+        re.search(rf'\b{s}\b', page.url, re.I) for s in SUFFIXES
+    )
+
+    if already_on_page:
+        print("Already in page context.")
+    else:
+        switched = False
+
+        # Step 1: check if Facebook is already showing a Switch Now prompt
+        switched = _switch_to_page_if_prompted(page)
+
+        # Step 2: scroll sidebar and look for a page link by category suffix
+        if not switched:
+            try:
+                for _ in range(25):
+                    for link in page.locator("a").all():
+                        text = (link.text_content() or "").strip()
+                        if any(re.search(rf'\b{s}\b', text) for s in SUFFIXES):
+                            print(f"Found page in sidebar: '{text}' — clicking...")
+                            link.click()
+                            human_pause(2.0, 3.0)
+                            _switch_to_page_if_prompted(page)
+                            if page.url not in base_urls:
+                                switched = True
+                            break
+                    if switched:
+                        break
+                    page.evaluate(
+                        "document.querySelector('[data-pagelet=\"LeftRail\"]')?.scrollBy(0, 300)"
+                    )
+                    human_pause(0.4, 0.6)
+            except Exception as exc:
+                log.debug("_setup_session: ignored error: %s", exc)
+
+        # Step 3: navigate to Pages Manager and pick the first managed page
+        if not switched:
+            print("Could not find page in sidebar — navigating to Pages Manager...")
+            js_navigate(page, "https://www.facebook.com/pages/manage/")
+            try:
+                page.wait_for_load_state("domcontentloaded", timeout=20000)
+            except Exception as exc:
+                log.debug("_setup_session: ignored error: %s", exc)
+            try:
+                page.wait_for_selector("div[role='main']", timeout=10000)
+            except Exception as exc:
+                log.debug("_setup_session: ignored error: %s", exc)
+            human_pause(2.0, 3.0)
+
+            EXCLUDED_SLUGS = {
+                "pages", "settings", "notifications", "login", "marketplace",
+                "groups", "events", "bookmarks", "gaming", "watch", "help",
+                "privacy", "policies", "terms", "about", "business", "ads",
+                "friends", "memories", "saved", "videos", "photos", "reels",
+                "fundraisers", "climate", "jobs", "professional-dashboard",
+                "professional_dashboard", "dashboard", "creatorstudio",
+                "facebook", "messenger", "instagram",
+            }
+            EXCLUDED_PARAMS = {"action=", "story_fbid", "__cft__"}
+            page_link = None
+            all_links = page.locator("a[href]").all()
+            # Pass 1: prefer numeric page IDs (most reliable)
+            for link in all_links:
+                href = (link.get_attribute("href") or "").split("?")[0]
+                if not href.startswith("https://www.facebook.com/"):
+                    continue
+                slug = href.replace("https://www.facebook.com/", "").strip("/")
+                if re.match(r'^\d{10,}$', slug):
+                    page_link = href
+                    print(f"Found managed page (ID): {href}")
+                    break
+            # Pass 2: slug-based with expanded exclusion list
+            if not page_link:
+                for link in all_links:
+                    href = link.get_attribute("href") or ""
+                    if not href.startswith("https://www.facebook.com/"):
+                        continue
+                    if any(p in href for p in EXCLUDED_PARAMS):
+                        continue
+                    slug = href.replace("https://www.facebook.com/", "").split("?")[0].strip("/")
+                    if slug and "/" not in slug and slug not in EXCLUDED_SLUGS:
+                        page_link = href
+                        print(f"Found managed page (slug): {href}")
+                        break
+
+            if page_link:
+                js_navigate(page, page_link)
+                try:
+                    page.wait_for_selector("div[role='main']", timeout=15000)
+                except Exception as exc:
+                    log.debug("_setup_session: ignored error: %s", exc)
+                human_pause(2.0, 3.0)
+                _switch_to_page_if_prompted(page)
+            else:
+                raise RuntimeError(
+                    "No managed Facebook Page found. Make sure the profile is logged in "
+                    "and has a Page assigned at facebook.com/pages/manage/"
+                )
+
+    return page.url
+
+
+def post_with_cdp(cdp_url, posts_path, min_delay=DEFAULT_MIN_DELAY, max_delay=DEFAULT_MAX_DELAY, account_name=""):
+    """Run the full posting flow on an already-open Multilogin profile (CDP URL).
+    Does not start or stop the profile — caller owns the lifecycle."""
     posts = parse_posts(posts_path)
     print(f"Loaded {len(posts)} posts from {posts_path}")
     for i, p in enumerate(posts):
         preview = p["text"][:60].replace("\n", " ")
         print(f"  {i+1}. {'[LINK] ' if p['url'] else ''}  {preview}...")
 
-    mlx, started = start_profile_for(account_name)
-
     with sync_playwright() as p:
-        try:
-            browser = p.chromium.connect_over_cdp(started.cdp_url)
-            context = browser.contexts[0]
-            page = context.pages[0] if context.pages else context.new_page()
-
-            print("\nChecking session...")
-            SUFFIXES = ["LS", "HOB", "CSI", "MF"]
-
-            # "facebook.com" alone also matches adsmanager.facebook.com,
-            # business.facebook.com, etc. — a profile left open on one of
-            # those from a prior session would be wrongly treated as
-            # already on the main feed, and the composer search below
-            # would fail against the wrong page entirely.
-            if "www.facebook.com" not in page.url:
-                js_navigate(page, "https://www.facebook.com/")
-                human_pause(2.0, 3.0)
-
-            if "login" in page.url:
-                print("Not logged in. Run manual_session.py first.")
-                sys.exit(1)
-
-            # Check if already in page context by looking at the composer placeholder
+        last_err = None
+        for _attempt in range(6):
             try:
-                main_text = page.locator("div[role='main']").first.text_content(timeout=8000) or ""
-            except Exception as exc:
-                log.debug("could not read main content for page-context check: %s", exc)
-                main_text = ""
-            already_on_page = any(
-                re.search(rf'\b{s}\b', page.url, re.I) or
-                re.search(rf'\b{s}\b', main_text, re.I)
-                for s in SUFFIXES
+                browser = p.chromium.connect_over_cdp(cdp_url)
+                break
+            except Exception as e:
+                last_err = e
+                wait = 5 * (_attempt + 1)
+                print(f"  CDP not ready yet — retrying in {wait}s ({_attempt + 1}/6)...")
+                time.sleep(wait)
+        else:
+            raise RuntimeError(f"Could not connect to Multilogin browser after 6 attempts: {last_err}")
+        context = browser.contexts[0]
+        page = context.pages[0] if context.pages else context.new_page()
+
+        print("\nChecking session...")
+        try:
+            active_page_url = _setup_session(page, account_name)
+        except Exception as e:
+            if "closed" in str(e).lower() or "target" in str(e).lower():
+                raise RuntimeError(
+                    "Multilogin browser closed unexpectedly during session setup — "
+                    "the profile may have been stopped by a previous run. Retry in a few seconds."
+                ) from e
+            raise
+        print(f"Active page URL: {active_page_url}")
+        if active_page_url in {"https://www.facebook.com/", "https://www.facebook.com", "https://m.facebook.com/"}:
+            raise RuntimeError("Could not navigate to a Facebook Page — check that the profile is logged in.")
+        if account_name:
+            _save_page_url(account_name, active_page_url)
+        print("Session active.\n")
+
+        for i, post in enumerate(posts):
+            image_path = IMAGES_DIR / f"post_{i + 1}.jpg"
+            should_navigate = True
+            publish_post(
+                page, post, i, active_page_url,
+                image_path if image_path.exists() else None,
+                navigate=should_navigate,
             )
+            if i < len(posts) - 1:
+                delay = random.randint(min_delay, max_delay)
+                print(f"Waiting {delay}s before next post...")
+                time.sleep(delay)
 
-            if already_on_page:
-                print("Already in page context.")
-            else:
-                # Try sidebar link by category suffix
-                switched = False
-                try:
-                    all_links = page.locator("a").all()
-                    for link in all_links:
-                        text = (link.text_content() or "").strip()
-                        if any(re.search(rf'\b{s}\b', text) for s in SUFFIXES):
-                            print(f"Found page in sidebar: '{text}' — clicking...")
-                            link.click()
-                            page.wait_for_load_state("domcontentloaded")
-                            human_pause(2.0, 3.0)
-                            switched = True
-                            break
-                except Exception as exc:
-                    log.debug("sidebar page-link scan failed: %s", exc)
-
-                # Fallback: Switch Now button
-                if not switched:
-                    try:
-                        for locator in [
-                            page.get_by_role("button", name=re.compile(r"switch now", re.I)),
-                            page.get_by_role("link",   name=re.compile(r"switch now", re.I)),
-                            page.locator("a:has-text('Switch Now'), div[role='button']:has-text('Switch Now')"),
-                        ]:
-                            if locator.count() > 0:
-                                print("Clicking Switch Now...")
-                                locator.first.click()
-                                page.wait_for_load_state("domcontentloaded")
-                                human_pause(2.0, 3.0)
-                                switched = True
-                                break
-                    except Exception as exc:
-                        log.debug("Switch Now fallback failed: %s", exc)
-
-                if not switched:
-                    print("Could not find page in sidebar or Switch Now — continuing with current URL.")
-
-            active_page_url = page.url
-            print(f"Active page URL: {active_page_url}")
-            print("Session active. Starting to post...\n")
-
-            for i, post in enumerate(posts):
-                image_path = IMAGES_DIR / f"post_{i + 1}.jpg"
-                success = publish_post(
-                    page, post, i, active_page_url,
-                    image_path if image_path.exists() else None,
-                    navigate=(i == 0),
-                )
-                if success and i < len(posts) - 1:
-                    delay = random.randint(min_delay, max_delay)
-                    print(f"Waiting {delay}s before next post...")
-                    time.sleep(delay)
-
-            print("\nAll posts done.")
+        print("\nAll posts done.")
+        if account_name:
             post_info = capture_published_post(page)
             save_last_post(account_name, post_info)
             if post_info and post_info.get("post_id"):
@@ -535,13 +809,24 @@ def run(account_name, posts_path, min_delay=DEFAULT_MIN_DELAY, max_delay=DEFAULT
                     "to inferring the most recent post and will warn you to verify it."
                 )
 
-            print("Browser is open. Close it when done.")
-            try:
-                page.wait_for_event("close", timeout=0)
-            except Exception as exc:
-                log.debug("wait_for_event(close) ended: %s", exc)
-        finally:
-            pass  # Leave profile running so next run reconnects to the live session
+
+def run_phase1(account_name, posts_path, min_delay=DEFAULT_MIN_DELAY, max_delay=DEFAULT_MAX_DELAY):
+    """Start profile, post, and return (mlx, started) with the profile still running.
+    Caller is responsible for stopping the profile afterwards."""
+    mlx, started = start_profile_for(account_name)
+    post_with_cdp(started.cdp_url, posts_path, min_delay, max_delay, account_name=account_name)
+    return mlx, started
+
+
+def run(account_name, posts_path, min_delay=DEFAULT_MIN_DELAY, max_delay=DEFAULT_MAX_DELAY):
+    mlx, started = start_profile_for(account_name)
+    try:
+        post_with_cdp(started.cdp_url, posts_path, min_delay, max_delay, account_name=account_name)
+    finally:
+        try:
+            mlx.stop_profile(started.profile_id)
+        except Exception as exc:
+            log.debug("run: ignored error: %s", exc)
 
 
 def main():

@@ -4,3 +4,5 @@ requests==2.34.2
 openpyxl==3.1.5
 reportlab==5.0.1
 textverified==0.1.0a2
+huggingface_hub==2.0.0
+pillow==12.3.0

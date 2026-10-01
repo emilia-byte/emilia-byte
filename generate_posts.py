@@ -27,7 +27,6 @@ import random
 import re
 import sys
 import time
-import urllib.parse
 from pathlib import Path
 
 import requests
@@ -52,6 +51,8 @@ POSTS_PATH   = Path(__file__).parent / "posts.txt"
 IMAGES_PATH  = Path(__file__).parent / "image_suggestions.txt"
 IMAGES_DIR   = Path(__file__).parent / "images"
 CURRENT_URL_PATH = Path(__file__).parent / "current_url.json"
+LIBRARY_DIR        = IMAGES_DIR / "library"
+USED_CONTENT_FILE  = Path(__file__).parent / "used_content.json"
 
 
 def _load_current_url() -> str:
@@ -197,7 +198,7 @@ TEMPLATES = {
         ],
         "emojis_pool": ["🎨", "🎯", "🖌️", "📷", "🎸", "✂️", "🪴", "📚", "🎭", "🧩"],
         "images": [
-            "Close-up of hands working on a craft project — thread, clay, or wood — in warm natural light.",
+            "A craft project in progress on a wooden table — thread, clay, or tools — in warm natural light.",
             "A flat lay of hobby tools and materials arranged neatly on a textured surface.",
             "Someone fully focused on a creative activity at a well-lit table, from behind.",
             "A bookshelf, instrument, or creative corner shot in golden hour light.",
@@ -258,7 +259,7 @@ TEMPLATES = {
             "A whiteboard or notebook with a clear, simple diagram — not branded, just structure.",
             "A calm workspace at the end of the day — one lamp on, organized desk.",
             "Two people in a focused conversation at a table, no phones visible.",
-            "A close-up of a highlighted page in an open book with a coffee in the background.",
+            "An open highlighted book on a desk with a coffee cup in the background, top-down view.",
         ],
     },
 
@@ -313,37 +314,71 @@ TEMPLATES = {
             "A simple bar or line graph printed on paper, placed on a wooden table.",
             "Someone looking at a phone screen with charts, photographed from the side in good light.",
             "A tidy workspace with a single plant, a notebook, and a glass of water.",
-            "Close-up of hands writing numbers in a notebook — warm, natural light.",
+            "An open notebook with numbers and a pen resting on it — warm, natural light, no person visible.",
         ],
     },
 }
 
 
+# ── Used-content persistence ──────────────────────────────────────────────────
+
+def _load_used(category: str) -> dict[str, set]:
+    if USED_CONTENT_FILE.exists():
+        data = __import__("json").loads(USED_CONTENT_FILE.read_text())
+        cat = data.get(category, {})
+    else:
+        cat = {}
+    return {k: set(cat.get(k, [])) for k in ("openers", "closers", "bodies", "images")}
+
+
+def _save_used(category: str, used: dict[str, set]) -> None:
+    import json
+    data = json.loads(USED_CONTENT_FILE.read_text()) if USED_CONTENT_FILE.exists() else {}
+    data[category] = {k: sorted(v) for k, v in used.items()}
+    USED_CONTENT_FILE.write_text(json.dumps(data, indent=2) + "\n")
+
+
 # ── Post builder ──────────────────────────────────────────────────────────────
 
-def build_post(category: str, used_openers: set, used_closers: set) -> tuple[str, str]:
+def build_post(category: str, used_openers: set, used_closers: set, used_images: set, used_bodies: set) -> tuple[str, str]:
     """
     Build one post from templates. Returns (post_text, image_suggestion).
-    Avoids reusing openers and closers within the same run.
+    Avoids reusing openers, closers, bodies, and images within and across runs.
     """
     t = TEMPLATES[category]
 
     available_openers = [o for o in t["openers"] if o not in used_openers]
     available_closers = [c for c in t["closers"] if c not in used_closers]
+    available_images  = [i for i in t["images"]  if i not in used_images]
+    available_bodies  = [b for b in t["bodies"]   if b not in used_bodies]
 
     if not available_openers:
+        used_openers.clear()
         available_openers = t["openers"]
     if not available_closers:
+        used_closers.clear()
         available_closers = t["closers"]
+    if not available_images:
+        used_images.clear()
+        available_images = t["images"]
+    if not available_bodies:
+        used_bodies.clear()
+        available_bodies = t["bodies"]
 
     opener = random.choice(available_openers)
     closer = random.choice(available_closers)
+    image  = random.choice(available_images)
     used_openers.add(opener)
     used_closers.add(closer)
+    used_images.add(image)
 
-    # Pick 1 or 2 body sentences
+    # Pick 1 or 2 body sentences without repeating across runs
     body_count = random.randint(1, 2)
-    bodies = random.sample(t["bodies"], min(body_count, len(t["bodies"])))
+    chosen_bodies = []
+    for _ in range(min(body_count, len(available_bodies))):
+        pick = random.choice([b for b in available_bodies if b not in chosen_bodies])
+        chosen_bodies.append(pick)
+        used_bodies.add(pick)
 
     # Emojis (1-3, placed at end of text before hashtags)
     emojis = " ".join(random.sample(t["emojis_pool"], random.randint(1, 3)))
@@ -352,32 +387,59 @@ def build_post(category: str, used_openers: set, used_closers: set) -> tuple[str
     hashtags = " ".join(random.sample(t["hashtags_pool"], random.randint(3, 5)))
 
     # Assemble
-    sentences = [opener] + bodies + [closer]
+    sentences = [opener] + chosen_bodies + [closer]
     text = " ".join(sentences)
     post = f"{text} {emojis}\n{hashtags}"
-
-    # Image suggestion
-    image = random.choice(t["images"])
 
     return post, image
 
 
 def generate_three_posts(category: str, url: str) -> tuple[list[str], list[str]]:
     """Generate 3 unique posts. URL goes in the first post only."""
-    used_openers: set = set()
-    used_closers: set = set()
+    used = _load_used(category)
+    used_openers = used["openers"]
+    used_closers = used["closers"]
+    used_images  = used["images"]
+    used_bodies  = used["bodies"]
 
     posts = []
     images = []
 
     for i in range(3):
-        post, image = build_post(category, used_openers, used_closers)
+        post, image = build_post(category, used_openers, used_closers, used_images, used_bodies)
         if i == 0:
             post = f"{post}\n{url}"
         posts.append(post)
         images.append(image)
 
+    _save_used(category, {"openers": used_openers, "closers": used_closers,
+                          "images": used_images, "bodies": used_bodies})
     return posts, images
+
+
+def generate_for_profiles(profiles: list[str], category: str, url: str) -> dict[str, Path]:
+    """Generate unique posts for each profile, saved as posts_{profile}.txt.
+    Uses a shared used-content tracker across all profiles so no two get the same opener/body/closer."""
+    root = Path(__file__).parent
+    used = _load_used(category)
+    results: dict[str, Path] = {}
+
+    for profile in profiles:
+        posts = []
+        for i in range(3):
+            post, _ = build_post(category, used["openers"], used["closers"],
+                                 used["images"], used["bodies"])
+            if i == 0:
+                post = f"{post}\n{url}"
+            posts.append(post)
+
+        path = root / f"posts_{profile}.txt"
+        path.write_text("\n\n".join(posts) + "\n", encoding="utf-8")
+        print(f"  {profile} → {path.name}")
+        results[profile] = path
+
+    _save_used(category, used)
+    return results
 
 
 # ── Page name detection ───────────────────────────────────────────────────────
@@ -388,15 +450,15 @@ def detect_page_name(page) -> str | None:
     js_navigate(page, "https://www.facebook.com/")
     time.sleep(3)
 
-    # Scroll the left sidebar down so "Your shortcuts" / Pages section loads
-    for _ in range(4):
+    # Scroll the left sidebar with mouse wheel (more reliable than JS scrollBy)
+    vp = page.viewport_size or {"width": 1280, "height": 800}
+    for _ in range(8):
         try:
-            page.evaluate(
-                "document.querySelector('[data-pagelet=\"LeftRail\"]')?.scrollBy(0, 300)"
-            )
+            page.mouse.move(140, int(vp["height"] * 0.5))
+            page.mouse.wheel(0, 300)
         except Exception as exc:
             log.debug("sidebar scroll failed: %s", exc)
-        time.sleep(0.7)
+        time.sleep(0.5)
 
     # Scan all sidebar links for a known category suffix in their text
     try:
@@ -432,29 +494,88 @@ def extract_category(text: str) -> tuple[str, str] | tuple[None, None]:
     return None, None
 
 
-# ── Image generation ─────────────────────────────────────────────────────────
+# ── Image generation (Hugging Face) ──────────────────────────────────────────
+
+HF_MODEL = "black-forest-labs/FLUX.1-schnell"
+
+
+def _hf_token() -> str | None:
+    env_file = Path(__file__).parent / ".env"
+    if env_file.exists():
+        for line in env_file.read_text().splitlines():
+            if line.startswith("HF_TOKEN="):
+                return line.split("=", 1)[1].strip()
+    return os.environ.get("HF_TOKEN", "").strip() or None
+
 
 def generate_image(prompt: str, index: int) -> Path | None:
+    token = _hf_token()
+    if not token:
+        print(f"  Skipping image {index + 1} — HF_TOKEN not set in .env")
+        return None
+
+    try:
+        from huggingface_hub import InferenceClient
+    except ImportError:
+        print("  huggingface_hub not installed — run: pip install huggingface_hub")
+        return None
+
     IMAGES_DIR.mkdir(exist_ok=True)
     out = IMAGES_DIR / f"post_{index + 1}.jpg"
-
-    encoded = urllib.parse.quote(prompt)
-    url = (
-        f"https://image.pollinations.ai/prompt/{encoded}"
-        f"?width=1024&height=1024&nologo=true&model=flux"
+    clean_prompt = (
+        prompt
+        + ", no text, no words, no watermark, photorealistic, high quality"
+        + ", no close-up of hands or fingers, no deformed anatomy, no extra fingers"
     )
+
     print(f"  Generating image {index + 1}...", end=" ", flush=True)
-    try:
-        resp = requests.get(url, timeout=60)
-        if resp.ok:
-            out.write_bytes(resp.content)
+    for attempt in range(3):
+        try:
+            client = InferenceClient(token=token)
+            img = client.text_to_image(clean_prompt, model=HF_MODEL)
+            if img.mode != "RGB":
+                img = img.convert("RGB")
+            img.save(str(out), "JPEG", quality=90, optimize=True)
             print(f"saved → {out.name}")
             return out
-        else:
-            print(f"failed ({resp.status_code})")
-    except requests.RequestException as exc:
-        print(f"error: {exc}")
+        except Exception as exc:
+            err = str(exc)
+            if "loading" in err.lower() or "503" in err:
+                wait = (attempt + 1) * 10
+                print(f"model loading, retrying in {wait}s...", end=" ", flush=True)
+                import time as _t
+                _t.sleep(wait)
+            else:
+                print(f"failed: {err[:120]}")
+                return None
+    print("failed after 3 attempts")
     return None
+
+
+# ── Image library ────────────────────────────────────────────────────────────
+
+def select_images_from_library(suffix: str) -> bool:
+    """Pick 3 random images from images/library/{suffix}/ and copy to images/post_N.jpg.
+    Returns True if successful, False if library is missing or has too few images."""
+    import shutil
+    folder = LIBRARY_DIR / suffix
+    if not folder.exists():
+        print(f"  No library found at {folder} — skipping image selection.")
+        return False
+
+    candidates = [f for f in folder.iterdir()
+                  if f.suffix.lower() in (".jpg", ".jpeg", ".png") and f.is_file()]
+    if len(candidates) < 3:
+        print(f"  Library has only {len(candidates)} image(s) — need at least 3. Skipping.")
+        return False
+
+    IMAGES_DIR.mkdir(exist_ok=True)
+    picks = random.sample(candidates, 3)
+    for i, src in enumerate(picks, 1):
+        dst = IMAGES_DIR / f"post_{i}.jpg"
+        shutil.copy2(src, dst)
+        print(f"  post_{i}.jpg ← {src.name}")
+    return True
 
 
 # ── File writers ──────────────────────────────────────────────────────────────
@@ -503,22 +624,24 @@ def main():
             mlx.stop_profile(started.profile_id)
 
         if not page_name:
-            print(
-                "Could not detect the page name automatically.\n"
-                "Re-run with --category LS|HOB|CSI|MF to set it manually."
-            )
-            sys.exit(1)
+            print("Could not detect the page name automatically.")
 
-        print(f"Detected page name: {page_name}")
-        suffix, category = extract_category(page_name)
+        suffix = None
+        if page_name:
+            print(f"Detected page name: {page_name}")
+            suffix, category = extract_category(page_name)
+            if not suffix:
+                print(f"No known suffix found in '{page_name}'.")
 
-        if not category:
-            print(
-                f"No known suffix found in '{page_name}'.\n"
-                f"Known suffixes: {list(CATEGORY_MAP)}\n"
-                f"Re-run with --category LS|HOB|CSI|MF to override."
-            )
-            sys.exit(1)
+        if not suffix:
+            LABELS = {"LS": "Lifestyle", "HOB": "Hobbies", "CSI": "Career and Self Improvement", "MF": "Market and Finance"}
+            print(f"Known categories: {', '.join(f'{k} ({v})' for k, v in LABELS.items())}")
+            while True:
+                raw = input("  Enter category [LS/HOB/CSI/MF]: ").strip().upper()
+                if raw in CATEGORY_MAP:
+                    suffix, category = raw, CATEGORY_MAP[raw]
+                    break
+                print(f"  Unknown category '{raw}'. Please enter one of: LS, HOB, CSI, MF")
 
         print(f"Category: {category} ({suffix})")
 
@@ -532,10 +655,14 @@ def main():
     write_posts_txt(posts)
     write_images_txt(image_prompts)
 
-    print("\nGenerating images...")
-    image_paths = [generate_image(prompt, i) for i, prompt in enumerate(image_prompts)]
-    saved = [p for p in image_paths if p]
-    print(f"{len(saved)}/3 images saved to images/")
+    if _hf_token():
+        print("\nGenerating images via Hugging Face...")
+        saved = [generate_image(p, i) for i, p in enumerate(image_prompts)]
+        print(f"{sum(1 for p in saved if p)}/3 images saved.")
+    else:
+        print("\nNo HF_TOKEN found — selecting from library...")
+        if not select_images_from_library(suffix):
+            print("Place images manually as images/post_1.jpg, post_2.jpg, post_3.jpg")
 
     print("\nDone. Run next:")
     print(f'  python3 post.py --account "{args.account}" --posts posts.txt')

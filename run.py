@@ -69,39 +69,43 @@ def pick_account() -> str:
 
     accounts = list_accounts()
 
-    print("\n── Accounts ──────────────────────────────────────────────")
-    for i, name in enumerate(accounts, 1):
-        print(f"  {i}. {name}")
-    print(f"  S. Sync profiles from Multilogin")
+    def _show_list():
+        print("\n── Accounts ──────────────────────────────────────────────")
+        for i, name in enumerate(accounts, 1):
+            print(f"  {i}. {name}")
+        print("  S. Sync profiles from Multilogin")
+        print("  Or type any profile name directly")
+
+    _show_list()
 
     while True:
-        choice = input(f"\n  Pick an account [1-{len(accounts)}] or S to sync: ").strip().lower()
-        if choice == "s":
+        choice = input(f"\n  Pick [1-{len(accounts)}], S to sync, or type a name: ").strip()
+        if choice.lower() == "s":
             run_cmd(["sync_profiles.py"])
             accounts = list_accounts()
-            print("\n── Accounts ──────────────────────────────────────────────")
-            for i, name in enumerate(accounts, 1):
-                print(f"  {i}. {name}")
-            print(f"  S. Sync profiles from Multilogin")
+            _show_list()
         elif choice.isdigit() and 1 <= int(choice) <= len(accounts):
             return accounts[int(choice) - 1]
+        elif choice:
+            return choice  # start_profile_for will resolve via live API lookup if needed
         else:
-            print("  Please enter a number from the list, or S to sync.")
+            print("  Please enter a number, S, or a profile name.")
 
 
 # ── Mode picker ───────────────────────────────────────────────────────────────
 
 def pick_mode() -> str:
     print("\n── What do you want to do? ───────────────────────────────")
-    print("  1. Generate posts + publish  (full run)")
-    print("  2. Generate posts only")
-    print("  3. Publish existing posts.txt")
+    print("  1. Generate posts + publish  (full run, one profile)")
+    print("  2. Generate posts only       (one profile)")
+    print("  3. Publish existing posts.txt (one profile)")
+    print("  4. Batch: generate unique posts per profile + publish all")
 
     while True:
-        choice = input("\n  Pick [1-3]: ").strip()
-        if choice in ("1", "2", "3"):
+        choice = input("\n  Pick [1-4]: ").strip()
+        if choice in ("1", "2", "3", "4"):
             return choice
-        print("  Please enter 1, 2, or 3.")
+        print("  Please enter 1, 2, 3, or 4.")
 
 
 # ── Category picker (optional override) ──────────────────────────────────────
@@ -150,6 +154,94 @@ def generate(account: str, category: str | None) -> bool:
     return run_cmd(cmd)
 
 
+def batch_generate_and_publish(category: str | None) -> bool:
+    import json
+    from mlx_context import list_accounts
+
+    profiles = list_accounts()
+    if not profiles:
+        print("No profiles found in mlx_profiles.json.")
+        return False
+
+    # ── Profile selection ──────────────────────────────────────────────────
+    print(f"\n── Batch mode: profile selection ─────────────────────────")
+    print(f"  Available ({len(profiles)}): {', '.join(profiles)}")
+    print(f"\n  A        — run all {len(profiles)} profiles")
+    print(f"  15       — run first 15  (or any number)")
+    print(f"  name,... — comma-separated list (e.g. EMI_AUTO_2,EMI_AUTO_5)")
+
+    while True:
+        sel = input("\n  Pick: ").strip()
+        if not sel or sel.upper() == "A":
+            selected = profiles
+            break
+        elif sel.isdigit():
+            n = int(sel)
+            selected = profiles[:n]
+            if not selected:
+                print(f"  No profiles available.")
+                continue
+            break
+        else:
+            names = [s.strip() for s in sel.split(",") if s.strip()]
+            invalid = [n for n in names if n not in profiles]
+            if invalid:
+                print(f"  Unknown profiles: {', '.join(invalid)}. Available: {', '.join(profiles)}")
+                continue
+            selected = names
+            break
+
+    profiles = selected
+    print(f"\n  Running on {len(profiles)} profile(s): {', '.join(profiles)}")
+
+    if not category:
+        CATEGORIES = {"1": "LS", "2": "HOB", "3": "CSI", "4": "MF"}
+        LABELS = {"LS": "Lifestyle", "HOB": "Hobbies",
+                  "CSI": "Career and Self Improvement", "MF": "Market and Finance"}
+        print("\n── Post category ─────────────────────────────────────────")
+        for k, code in CATEGORIES.items():
+            print(f"  {k}. {code} — {LABELS[code]}")
+        while True:
+            choice = input("\n  Pick [1-4]: ").strip()
+            if choice in CATEGORIES:
+                category = CATEGORIES[choice]
+                break
+            print("  Please enter 1, 2, 3, or 4.")
+
+    workers = input(f"\n  How many to run simultaneously? [default: {min(len(profiles), 5)}]: ").strip()
+    workers = int(workers) if workers.isdigit() and int(workers) > 0 else min(len(profiles), 5)
+
+    print("\n" + "─" * 54)
+    print(f"Generating unique posts for {len(profiles)} profiles...")
+    print("─" * 54)
+
+    from generate_posts import generate_for_profiles, _hf_token, generate_image, IMAGES_DIR, write_images_txt
+    from generate_posts import generate_three_posts, CATEGORY_MAP, resolve_url
+
+    cat_name = CATEGORY_MAP[category]
+    url = resolve_url(None)
+    print(f"Category: {cat_name}\n")
+    generate_for_profiles(profiles, cat_name, url)
+
+    hf = _hf_token()
+    if hf:
+        print("\nGenerating 3 shared images via Hugging Face...")
+        _, image_prompts = generate_three_posts(cat_name, url)
+        write_images_txt(image_prompts)
+        saved = [generate_image(p, i) for i, p in enumerate(image_prompts)]
+        print(f"{sum(1 for p in saved if p)}/3 images saved.")
+    else:
+        print("\nNo HF_TOKEN — place images manually as images/post_1.jpg, post_2.jpg, post_3.jpg")
+
+    print("\n" + "─" * 54)
+    print(f"Batch publishing to {len(profiles)} profiles ({workers} at a time)...")
+    print("─" * 54)
+
+    return run_cmd(["post_batch.py", "--posts", str(ROOT / "posts.txt"),
+                    "--profiles", ",".join(profiles),
+                    "--workers", str(workers)])
+
+
 def publish(account: str) -> bool:
     if not POSTS_FILE.exists():
         print(f"\nError: {POSTS_FILE} not found. Run 'Generate posts' first.")
@@ -168,23 +260,27 @@ def main():
     print("=" * 54)
 
     ensure_credentials()
-    account = pick_account()
     mode = pick_mode()
 
     ok = True
 
-    if mode == "1":
+    if mode == "4":
         category = pick_category()
-        ok = generate(account, category)
-        if ok:
+        ok = batch_generate_and_publish(category)
+    else:
+        account = pick_account()
+        if mode == "1":
+            category = pick_category()
+            ok = generate(account, category)
+            if ok:
+                ok = publish(account)
+
+        elif mode == "2":
+            category = pick_category()
+            ok = generate(account, category)
+
+        elif mode == "3":
             ok = publish(account)
-
-    elif mode == "2":
-        category = pick_category()
-        ok = generate(account, category)
-
-    elif mode == "3":
-        ok = publish(account)
 
     print("\n" + "=" * 54)
     if ok:
