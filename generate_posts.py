@@ -29,6 +29,8 @@ import sys
 import time
 from pathlib import Path
 
+import console  # noqa: F401 -- UTF-8 output when redirected to a log (see console.py)
+
 import requests
 from playwright.sync_api import sync_playwright
 

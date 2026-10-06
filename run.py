@@ -10,6 +10,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import console  # noqa: F401 -- UTF-8 output when redirected to a log (see console.py)
+
 ROOT = Path(__file__).parent
 ENV_FILE = ROOT / ".env"
 POSTS_FILE = ROOT / "posts.txt"

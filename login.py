@@ -34,6 +34,8 @@ import time
 from openpyxl import load_workbook
 from playwright.sync_api import sync_playwright
 
+import console  # noqa: F401 -- UTF-8 output when redirected to a log (see console.py)
+
 from mlx_context import start_profile_for
 from fb_dom import js_navigate
 

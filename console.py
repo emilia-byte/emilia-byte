@@ -19,8 +19,24 @@ from __future__ import annotations
 
 import asyncio
 import builtins
+import sys
 import threading
 from contextvars import ContextVar
+
+def _utf8_when_redirected() -> None:
+    """Python on Windows writes redirected output (a pipe, or a log file
+    for a big batch run) as cp1252, which can't encode the box-drawing and
+    dash characters every menu uses -- the script dies on its first print.
+    Consoles already get UTF-8 and are left alone."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            if stream is not None and not stream.isatty() and stream.encoding.lower() != "utf-8":
+                stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass  # replaced or closed stream (e.g. under pytest capture) -- leave it
+
+
+_utf8_when_redirected()
 
 profile_tag: ContextVar[str] = ContextVar("profile_tag", default="")
 

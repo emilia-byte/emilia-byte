@@ -15,6 +15,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import console  # noqa: F401 -- UTF-8 output when redirected to a log (see console.py)
+
 ROOT = Path(__file__).parent
 PROFILES_FILE = ROOT / "mlx_profiles.json"
 FOLDER_ID = "5bfc9a9a-4d09-4988-ad84-2e2b0cf107c6"
