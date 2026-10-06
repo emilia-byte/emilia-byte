@@ -497,6 +497,7 @@ def extract_category(text: str) -> tuple[str, str] | tuple[None, None]:
 # ── Image generation (Hugging Face) ──────────────────────────────────────────
 
 HF_MODEL = "black-forest-labs/FLUX.1-schnell"
+HF_TIMEOUT_SECONDS = 120
 
 
 def _hf_token() -> str | None:
@@ -528,16 +529,22 @@ def generate_image(prompt: str, index: int) -> Path | None:
         + ", no close-up of hands or fingers, no deformed anatomy, no extra fingers"
     )
 
+    from huggingface_hub import InferenceTimeoutError
+
     print(f"  Generating image {index + 1}...", end=" ", flush=True)
     for attempt in range(3):
         try:
-            client = InferenceClient(token=token)
+            # InferenceClient's timeout defaults to None ("loops until the
+            # server is available"), which can hang the whole run.
+            client = InferenceClient(token=token, timeout=HF_TIMEOUT_SECONDS)
             img = client.text_to_image(clean_prompt, model=HF_MODEL)
             if img.mode != "RGB":
                 img = img.convert("RGB")
             img.save(str(out), "JPEG", quality=90, optimize=True)
             print(f"saved → {out.name}")
             return out
+        except InferenceTimeoutError:
+            print(f"timed out after {HF_TIMEOUT_SECONDS}s ({attempt + 1}/3)...", end=" ", flush=True)
         except Exception as exc:
             err = str(exc)
             if "loading" in err.lower() or "503" in err:

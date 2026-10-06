@@ -13,6 +13,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 from multilogin_client import MultiloginClient
@@ -29,15 +30,26 @@ def _load_profiles() -> dict[str, str]:
     return json.loads(MLX_PROFILES_PATH.read_text())
 
 
+_shared_client: MultiloginClient | None = None
+_shared_client_lock = threading.Lock()
+
+
 def _client() -> MultiloginClient:
-    email = os.environ.get("MLX_EMAIL")
-    password = os.environ.get("MLX_PASSWORD")
-    if not email or not password:
-        print("Error: MLX_EMAIL and MLX_PASSWORD environment variables must be set.")
-        sys.exit(1)
-    client = MultiloginClient(email=email, password=password)
-    client.sign_in()
-    return client
+    """One signed-in client per process. A batch used to sign in once per
+    profile, and Multilogin's RPM limit (50-100/min) is shared by the whole
+    workspace; the client renews its own token, so sharing it is safe."""
+    global _shared_client
+    with _shared_client_lock:
+        if _shared_client is None:
+            email = os.environ.get("MLX_EMAIL")
+            password = os.environ.get("MLX_PASSWORD")
+            if not email or not password:
+                print("Error: MLX_EMAIL and MLX_PASSWORD environment variables must be set.")
+                sys.exit(1)
+            client = MultiloginClient(email=email, password=password)
+            client.sign_in()  # fail fast on bad credentials, before any profile starts
+            _shared_client = client
+        return _shared_client
 
 
 def _find_xcli() -> Path | None:

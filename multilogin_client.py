@@ -14,10 +14,9 @@ Usage:
         email=os.environ["MLX_EMAIL"],
         password=os.environ["MLX_PASSWORD"],
     )
-    mlx.sign_in()
-    port = mlx.start_profile(folder_id, profile_id)
+    started = mlx.start_profile(folder_id, profile_id)  # signs in on first use
 
-    browser = playwright.chromium.connect_over_cdp(f"http://127.0.0.1:{port}")
+    browser = playwright.chromium.connect_over_cdp(started.cdp_url)
     context = browser.contexts[0]
     page = context.pages[0] if context.pages else context.new_page()
 
@@ -37,6 +36,7 @@ import hashlib
 import json
 import logging
 import tempfile
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -47,6 +47,10 @@ log = logging.getLogger(__name__)
 
 AUTH_BASE = "https://api.multilogin.com"
 LAUNCHER_BASE = "https://launcher.mlx.yt:45001"
+
+# Multilogin docs: "The token expires in 30 minutes." Renew a little early so
+# a request never goes out on a token about to lapse mid-flight.
+TOKEN_TTL_SECONDS = 25 * 60
 
 _PORT_CACHE_DIR = Path(tempfile.gettempdir()) / "mlx_ports"
 
@@ -123,14 +127,19 @@ class StartedProfile:
 
 class MultiloginClient:
     """
-    Minimal wrapper around the two calls this workflow actually needs:
-    sign in once, then start a profile per account.
+    Minimal wrapper around the calls this workflow needs. Signs in lazily
+    and again whenever the token is near its 30-minute expiry or the API
+    answers 401, so one client can be shared by a whole batch (see
+    mlx_context._client) and still stop profiles at the end of a long run.
+    Safe to use from several threads.
     """
 
     def __init__(self, email: str, password: str):
         self._email = email
         self._password = password
         self._token: str | None = None
+        self._signed_in_at = 0.0
+        self._auth_lock = threading.Lock()
 
     def sign_in(self) -> None:
         """Authenticate and cache the bearer token for subsequent calls."""
@@ -148,8 +157,28 @@ class MultiloginClient:
             self._token = resp.json()["data"]["token"]
         except (KeyError, ValueError) as exc:
             raise MultiloginError(f"Unexpected sign-in response shape: {resp.text}") from exc
+        self._signed_in_at = time.monotonic()
 
         log.info("Signed in to Multilogin")
+
+    def _current_token(self) -> str:
+        with self._auth_lock:
+            if not self._token or time.monotonic() - self._signed_in_at > TOKEN_TTL_SECONDS:
+                self.sign_in()
+            return self._token
+
+    def _request(self, method: str, url: str, **kwargs) -> requests.Response:
+        """Authenticated request; on 401, sign in again and retry once."""
+        token = self._current_token()
+        resp = requests.request(method, url, headers={"Authorization": f"Bearer {token}"}, **kwargs)
+        if resp.status_code != 401:
+            return resp
+        log.info("Multilogin returned 401 — signing in again and retrying once")
+        with self._auth_lock:
+            if self._token == token:  # another thread may have renewed it already
+                self.sign_in()
+            token = self._token
+        return requests.request(method, url, headers={"Authorization": f"Bearer {token}"}, **kwargs)
 
     def start_profile(
         self,
@@ -161,18 +190,11 @@ class MultiloginClient:
         Start a Multilogin profile and return the local port Playwright
         should connect to via connect_over_cdp().
         """
-        if not self._token:
-            raise MultiloginError("Call sign_in() before start_profile()")
-
         url = (
             f"{LAUNCHER_BASE}/api/v2/profile/f/{folder_id}/p/{profile_id}/start"
             f"?automation_type=playwright&headless_mode={'true' if headless else 'false'}"
         )
-        resp = requests.get(
-            url,
-            headers={"Authorization": f"Bearer {self._token}"},
-            timeout=30,
-        )
+        resp = self._request("GET", url, timeout=30)
         if not resp.ok:
             # If already running, fetch the port from the active profile status
             if "PROFILE_ALREADY_RUNNING" in resp.text:
@@ -218,51 +240,51 @@ class MultiloginClient:
         )
 
     def search_profile_by_name(self, name: str, folder_id: str) -> str | None:
-        """Search Multilogin for a profile by exact name. Returns UUID or None."""
-        if not self._token:
-            raise MultiloginError("Call sign_in() before search_profile_by_name()")
-
-        page = 0
+        """
+        Find a profile by exact name via the documented POST /profile/search
+        (body: search_text/limit/offset/is_removed; results under
+        data.profiles[], each with an "id"). Returns the profile ID or None.
+        search_text is a fuzzy filter, so the exact-name check stays here.
+        """
+        offset, limit = 0, 100
         while True:
-            resp = requests.get(
-                f"{AUTH_BASE}/user/profile",
-                headers={"Authorization": f"Bearer {self._token}"},
-                params={"search": name, "folder_id": folder_id, "count": 100, "page": page},
+            resp = self._request(
+                "POST",
+                f"{AUTH_BASE}/profile/search",
+                json={
+                    "search_text": name,
+                    "is_removed": False,
+                    "limit": limit,
+                    "offset": offset,
+                    "storage_type": "all",
+                },
                 timeout=15,
             )
             if not resp.ok:
                 raise MultiloginError(f"Profile search failed ({resp.status_code}): {resp.text}")
-
             try:
-                body = resp.json()
-                # Handle both {data: [...]} and {data: {profiles: [...]}} shapes
-                data = body.get("data", [])
-                profiles = data if isinstance(data, list) else data.get("profiles", [])
-            except Exception as exc:
+                profiles = resp.json()["data"]["profiles"] or []
+            except (KeyError, TypeError, ValueError) as exc:
                 raise MultiloginError(f"Unexpected profile search response: {resp.text}") from exc
 
             for profile in profiles:
-                if profile.get("name") == name:
-                    return profile.get("uuid") or profile.get("id")
+                # Only trust the folder when the API reports one; a same-named
+                # profile in another folder can't be started under ours.
+                if profile.get("name") == name and profile.get("folder_id", folder_id) == folder_id:
+                    return profile.get("id")
 
-            if len(profiles) < 100:
+            if len(profiles) < limit:
                 return None
-            page += 1
+            offset += limit
 
     def stop_profile(self, profile_id: str) -> None:
         """Stop a running profile. Logs a warning rather than raising so it's safe in a finally block."""
-        if not self._token:
-            return
         try:
-            resp = requests.get(
-                f"{LAUNCHER_BASE}/api/v1/profile/stop/p/{profile_id}",
-                headers={"Authorization": f"Bearer {self._token}"},
-                timeout=30,
-            )
+            resp = self._request("GET", f"{LAUNCHER_BASE}/api/v1/profile/stop/p/{profile_id}", timeout=30)
             if not resp.ok:
                 log.warning("stop_profile(%s) returned %s: %s", profile_id, resp.status_code, resp.text)
             else:
                 log.info("Stopped Multilogin profile %s", profile_id)
                 _clear_port_cache(profile_id)
-        except requests.RequestException as exc:
+        except (requests.RequestException, MultiloginError) as exc:
             log.warning("stop_profile(%s) request failed: %s", profile_id, exc)
