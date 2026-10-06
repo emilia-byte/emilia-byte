@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<!-- Ad set "Locations" box after typing Paraguay + Enter on an account that
+     pre-fills other countries. Like React, every removal re-renders the whole
+     chip list, so element handles collected before a click go stale.
+     ?chips=a,b,c overrides the starting list. -->
+<html>
+<body>
+  <div id="chips"></div>
+  <script>
+    const param = new URLSearchParams(location.search).get("chips");
+    let chips = param ? param.split(",") : ["United States", "Paraguay", "Brazil"];
+    function render() {
+      const box = document.getElementById("chips");
+      box.innerHTML = "";
+      for (const name of chips) {
+        const chip = document.createElement("span");
+        chip.textContent = name;
+        const remove = document.createElement("div");
+        remove.setAttribute("role", "button");
+        remove.setAttribute("aria-label", "Remove " + name);
+        remove.textContent = "×";
+        remove.onclick = () => { chips = chips.filter(c => c !== name); render(); };
+        chip.appendChild(remove);
+        box.appendChild(chip);
+      }
+      window.__chips = chips.slice();
+    }
+    render();
+  </script>
+</body>
+</html>

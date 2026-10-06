@@ -252,10 +252,10 @@ async def _handle_verification(page) -> bool:
         phone = verification.phone_number
         print(f"  Got number: {phone}")
 
-        phone_input = await page.wait_for_selector(
-            'input[type="tel"], input[placeholder*="phone"], input[placeholder*="number"]',
-            timeout=10000,
-        )
+        phone_input = page.locator(
+            'input[type="tel"], input[placeholder*="phone"], input[placeholder*="number"]'
+        ).first
+        await phone_input.wait_for(timeout=10000)
         await phone_input.fill(phone)
         await page.wait_for_timeout(500)
 
@@ -274,10 +274,10 @@ async def _handle_verification(page) -> bool:
 
         if code:
             print(f"  Received code: {code}")
-            code_input = await page.wait_for_selector(
-                'input[placeholder*="code"], input[type="number"], input[autocomplete="one-time-code"]',
-                timeout=10000,
-            )
+            code_input = page.locator(
+                'input[placeholder*="code"], input[type="number"], input[autocomplete="one-time-code"]'
+            ).first
+            await code_input.wait_for(timeout=10000)
             await code_input.fill(code)
             await page.wait_for_timeout(500)
             for label in ["Confirm", "Submit", "Continue"]:
@@ -440,6 +440,43 @@ async def click_create_button(page, timeout: int = 4000) -> str | None:
     except Exception as exc:
         log.debug("fallback Create button match failed: %s", exc)
     return None
+
+
+async def remove_other_location_chips(page, keep: str, max_removals: int = 10) -> int:
+    """
+    Remove every location chip except `keep` (some accounts pre-fill a
+    default country). Uses a locator, re-resolved on every pass, rather than
+    element handles collected up front: each removal re-renders the chip
+    list (React), which leaves previously collected handles pointing at
+    detached nodes. Returns how many chips were removed.
+    """
+    others = page.locator(f'div[aria-label^="Remove "]:not([aria-label*="{keep}"])')
+    removed = 0
+    while removed < max_removals:
+        try:
+            if await others.count() == 0:
+                break
+            await others.first.click(timeout=5000)
+        except Exception as exc:
+            log.debug("location chip removal failed: %s", exc)
+            break
+        removed += 1
+        await page.wait_for_timeout(400)
+    return removed
+
+
+VERIFICATION_TEXTS = ["Verifying your changes", "Enter confirmation code", "confirm your identity"]
+
+
+async def needs_sms_verification(page) -> bool:
+    """True if Ads Manager is showing an identity / SMS verification step."""
+    for text in VERIFICATION_TEXTS:
+        try:
+            if await page.get_by_text(text).count() > 0:
+                return True
+        except Exception as exc:
+            log.debug("verification-prompt check for %r failed: %s", text, exc)
+    return False
 
 
 async def boost(cdp_url: str, account: str, publish: bool = False):
@@ -625,10 +662,7 @@ async def boost(cdp_url: str, account: str, publish: bool = False):
             await scroll_form(200)
             await page.wait_for_timeout(200)
 
-        inc_handle = await included.element_handle()
-        await page.evaluate(
-            "el => el.scrollIntoView({block: 'center', behavior: 'instant'})", inc_handle
-        )
+        await included.evaluate("el => el.scrollIntoView({block: 'center', behavior: 'instant'})")
         await page.wait_for_timeout(1000)
 
         # Click the Edit link nearest to the Locations heading
@@ -688,22 +722,7 @@ async def boost(cdp_url: str, account: str, publish: bool = False):
         await search.press("Enter")
         await page.wait_for_timeout(1000)
 
-        for _ in range(10):
-            try:
-                btns = await page.query_selector_all('div[aria-label^="Remove "]')
-                removed = False
-                for btn in btns:
-                    label = await btn.get_attribute("aria-label") or ""
-                    if "Paraguay" not in label:
-                        await btn.click()
-                        await page.wait_for_timeout(400)
-                        removed = True
-                        break
-                if not removed:
-                    break
-            except Exception as exc:
-                log.debug("boost: ignored error: %s", exc)
-                break
+        await remove_other_location_chips(page, keep="Paraguay")
 
         await page.get_by_role("button", name=re.compile(r"^Next$", re.I)).click(timeout=10000)
         try:
@@ -716,11 +735,7 @@ async def boost(cdp_url: str, account: str, publish: bool = False):
         try:
             ad_setup_heading = page.locator("text=Ad setup").first
             await ad_setup_heading.wait_for(state="attached", timeout=8000)
-            handle = await ad_setup_heading.element_handle()
-            await page.evaluate(
-                "el => el.scrollIntoView({block: 'start', behavior: 'instant'})",
-                handle,
-            )
+            await ad_setup_heading.evaluate("el => el.scrollIntoView({block: 'start', behavior: 'instant'})")
             await page.wait_for_timeout(500)
         except Exception as exc:
             log.debug("Ad setup heading scroll failed: %s", exc)
@@ -784,17 +799,7 @@ async def boost(cdp_url: str, account: str, publish: bool = False):
         await page.wait_for_timeout(3000)
 
         # ── SMS verification (if triggered) ───────────────────────
-        needs_verification = False
-        for text in ["Verifying your changes", "Enter confirmation code", "confirm your identity"]:
-            try:
-                el = await page.query_selector(f"text={text}")
-                if el:
-                    needs_verification = True
-                    break
-            except Exception as exc:
-                log.debug("verification-prompt check for %r failed: %s", text, exc)
-
-        if needs_verification:
+        if await needs_sms_verification(page):
             print("\nSMS verification required...")
             await _handle_verification(page)
 

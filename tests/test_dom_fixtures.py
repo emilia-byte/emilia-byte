@@ -192,3 +192,49 @@ def test_click_create_button_falls_back_to_accessible_name():
 
     assert strategy == "role=button[name=Create]"
     assert clicked == "create"  # not the "Create a view" decoy
+
+
+# ── boost.remove_other_location_chips / needs_sms_verification ────────────
+
+def _run_on_fixture(url: str, action):
+    async def scenario():
+        async with async_playwright() as p:
+            browser = await p.chromium.launch()
+            page = await browser.new_page()
+            await page.goto(url)
+            result = await action(page)
+            state = await page.evaluate("() => window.__chips || null")
+            await browser.close()
+            return result, state
+
+    return asyncio.run(scenario())
+
+
+def test_remove_other_location_chips_keeps_only_target_across_rerenders():
+    removed, chips = _run_on_fixture(
+        _uri("location_chips.html"),
+        lambda page: boost.remove_other_location_chips(page, keep="Paraguay"),
+    )
+
+    assert removed == 2
+    assert chips == ["Paraguay"]
+
+
+def test_remove_other_location_chips_noop_when_only_target_present():
+    removed, chips = _run_on_fixture(
+        _uri("location_chips.html") + "?chips=Paraguay",
+        lambda page: boost.remove_other_location_chips(page, keep="Paraguay"),
+    )
+
+    assert removed == 0
+    assert chips == ["Paraguay"]
+
+
+def test_needs_sms_verification_detects_prompt():
+    found, _ = _run_on_fixture(_uri("verification_prompt.html"), boost.needs_sms_verification)
+    assert found is True
+
+
+def test_needs_sms_verification_false_on_unrelated_page():
+    found, _ = _run_on_fixture(_uri("select_post_table.html"), boost.needs_sms_verification)
+    assert found is False
