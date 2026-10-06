@@ -11,6 +11,7 @@ import threading
 import time
 import types
 
+import batch_common
 import boost
 import boost_batch
 import console
@@ -138,7 +139,7 @@ def test_batch_run_profile_passes_account_and_tags_output(monkeypatch, capsys):
     started = types.SimpleNamespace(cdp_url="http://127.0.0.1:1", port=1, profile_id="pid")
     client = types.SimpleNamespace(stop_profile=lambda pid: None)
     monkeypatch.setattr(mlx_context, "start_profile_for", lambda name: (client, started))
-    monkeypatch.setattr(boost_batch.random, "uniform", lambda a, b: 0)
+    monkeypatch.setattr(batch_common, "LAUNCH_JITTER_SECONDS", (0, 0))
     seen = {}
 
     async def fake_boost(cdp_url, account, publish=False):

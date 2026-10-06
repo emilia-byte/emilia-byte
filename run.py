@@ -100,13 +100,17 @@ def pick_mode() -> str:
     print("  2. Generate posts only       (one profile)")
     print("  3. Publish existing posts.txt (one profile)")
     print("  4. Batch: generate unique posts per profile + publish all")
-    print("  5. Batch: boost the latest post on several profiles")
+    # Phase 2 (Ads Manager) ships separately; offer it only once it's unpacked here.
+    choices = ["1", "2", "3", "4"]
+    if (ROOT / "boost_batch.py").exists():
+        print("  5. Batch: boost the latest post on several profiles")
+        choices.append("5")
 
     while True:
-        choice = input("\n  Pick [1-5]: ").strip()
-        if choice in ("1", "2", "3", "4", "5"):
+        choice = input(f"\n  Pick [1-{choices[-1]}]: ").strip()
+        if choice in choices:
             return choice
-        print("  Please enter 1, 2, 3, 4, or 5.")
+        print(f"  Please enter one of: {', '.join(choices)}.")
 
 
 # ── Category picker (optional override) ──────────────────────────────────────

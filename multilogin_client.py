@@ -52,6 +52,10 @@ LAUNCHER_BASE = "https://launcher.mlx.yt:45001"
 # a request never goes out on a token about to lapse mid-flight.
 TOKEN_TTL_SECONDS = 25 * 60
 
+# 429 handling: Retry-After when sent, else 10s, 20s, 40s.
+RATE_LIMIT_RETRIES = 3
+RATE_LIMIT_BACKOFF_SECONDS = 10
+
 _PORT_CACHE_DIR = Path(tempfile.gettempdir()) / "mlx_ports"
 
 
@@ -168,9 +172,10 @@ class MultiloginClient:
             return self._token
 
     def _request(self, method: str, url: str, **kwargs) -> requests.Response:
-        """Authenticated request; on 401, sign in again and retry once."""
+        """Authenticated request; backs off on 429, and on 401 signs in
+        again and retries once."""
         token = self._current_token()
-        resp = requests.request(method, url, headers={"Authorization": f"Bearer {token}"}, **kwargs)
+        resp = self._send_with_backoff(method, url, token, **kwargs)
         if resp.status_code != 401:
             return resp
         log.info("Multilogin returned 401 — signing in again and retrying once")
@@ -178,7 +183,25 @@ class MultiloginClient:
             if self._token == token:  # another thread may have renewed it already
                 self.sign_in()
             token = self._token
-        return requests.request(method, url, headers={"Authorization": f"Bearer {token}"}, **kwargs)
+        return self._send_with_backoff(method, url, token, **kwargs)
+
+    def _send_with_backoff(self, method: str, url: str, token: str, **kwargs) -> requests.Response:
+        """Send once, retrying on 429. The workspace shares one requests-
+        per-minute budget, so a big batch (or a teammate's) can briefly
+        exhaust it; waiting it out beats failing that profile."""
+        headers = {"Authorization": f"Bearer {token}"}
+        for attempt in range(RATE_LIMIT_RETRIES + 1):
+            resp = requests.request(method, url, headers=headers, **kwargs)
+            if resp.status_code != 429 or attempt == RATE_LIMIT_RETRIES:
+                return resp
+            try:
+                wait = float(resp.headers.get("Retry-After", ""))
+            except ValueError:
+                wait = RATE_LIMIT_BACKOFF_SECONDS * (2 ** attempt)
+            log.warning("Multilogin rate limit hit (429) — waiting %.0fs (%d/%d)",
+                        wait, attempt + 1, RATE_LIMIT_RETRIES)
+            time.sleep(wait)
+        return resp
 
     def start_profile(
         self,

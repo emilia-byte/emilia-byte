@@ -15,10 +15,10 @@ import argparse
 import asyncio
 import json
 import os
-import random
 import sys
 from pathlib import Path
 
+from batch_common import LaunchPacer, use_thread_pool
 from console import profile_tag
 
 ROOT = Path(__file__).parent
@@ -42,6 +42,7 @@ async def run_profile(
     semaphore: asyncio.Semaphore,
     publish: bool,
     results: dict,
+    pacer: LaunchPacer | None = None,
 ):
     tag = f"[{profile_name}]"
     # Everything post.py/boost.py prints from this task (and the threads it
@@ -49,9 +50,10 @@ async def run_profile(
     profile_tag.set(tag)
 
     async with semaphore:
-        jitter = random.uniform(5, 20)
-        print(f"{tag} Waiting {jitter:.1f}s before launch (anti-detection stagger)...")
-        await asyncio.sleep(jitter)
+        # Spaced launches: Multilogin's request limit is shared by the whole
+        # workspace (see batch_common.py).
+        waited = await (pacer or LaunchPacer()).wait()
+        print(f"{tag} Launching (waited {waited:.1f}s for a launch slot)...")
 
         client = None
         started = None
@@ -82,11 +84,13 @@ async def run_profile(
 
 
 async def main_async(profiles: list[str], workers: int, publish: bool):
+    use_thread_pool(workers)  # else asyncio caps concurrent profiles at ~cpu_count+4
     semaphore = asyncio.Semaphore(workers)
+    pacer = LaunchPacer()
     results: dict[str, str] = {}
 
     tasks = [
-        run_profile(name, semaphore, publish, results)
+        run_profile(name, semaphore, publish, results, pacer)
         for name in profiles
     ]
 

@@ -20,8 +20,9 @@ from multilogin_client import MultiloginClient, MultiloginError
 
 
 class _Resp:
-    def __init__(self, status=200, body=None, text=""):
+    def __init__(self, status=200, body=None, text="", headers=None):
         self.status_code = status
+        self.headers = headers or {}
         self.ok = 200 <= status < 300
         self._body = body if body is not None else {}
         self.text = text or str(self._body)
